@@ -4,7 +4,7 @@
 # minimize the final image size.
 
 ## Stage 1: Build the web interface with Node
-FROM node:20-alpine AS web-builder
+FROM --platform=$BUILDPLATFORM node:20-alpine AS web-builder
 
 WORKDIR /usr/src/app
 # Copy only the web source to speed up caching. Adjust this pattern if your
@@ -19,8 +19,11 @@ RUN npm install --no-fund --no-audit && \
 
 
 ## Stage 2: Build the Go server
-# Use the latest Go image to satisfy the minimum version required by go.mod.
-FROM golang:latest AS server-builder
+# Use the latest Go image and cross‑compile for the target platform.  The
+# --platform=$TARGETPLATFORM directive instructs Buildx to set the proper
+# GOOS/GOARCH, allowing us to build linux/amd64 and linux/arm64 binaries from a
+# single build definition.  We disable CGO to simplify cross‑compilation.
+FROM --platform=$TARGETPLATFORM golang:latest AS server-builder
 
 WORKDIR /build
 
@@ -37,11 +40,12 @@ COPY --from=web-builder /usr/src/app/seanime-web/out ./web
 # Build the statically linked Seanime binary. We use `-trimpath` and strip
 # debugging information to reduce size. Tags and flags can be adjusted if
 # needed.
+ENV CGO_ENABLED=0
 RUN go build -o /seanime -trimpath -ldflags="-s -w" .
 
 
 ## Stage 3: Assemble the final image
-FROM alpine:3.19
+FROM --platform=$TARGETPLATFORM alpine:3.19
 
 # Install runtime dependencies (e.g. ffmpeg for transcoding, ca-certificates
 # for TLS). Adjust packages as necessary for your use case. If you don't need
