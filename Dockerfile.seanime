@@ -4,7 +4,7 @@
 # minimize the final image size.
 
 ## Stage 1: Build the web interface with Node
-FROM node:18-alpine AS web-builder
+FROM node:20-alpine AS web-builder
 
 WORKDIR /usr/src/app
 # Copy only the web source to speed up caching. Adjust this pattern if your
