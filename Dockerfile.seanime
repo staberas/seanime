@@ -19,7 +19,8 @@ RUN npm install --no-fund --no-audit && \
 
 
 ## Stage 2: Build the Go server
-FROM golang:1.26-alpine AS server-builder
+# Use the latest Go image to satisfy the minimum version required by go.mod.
+FROM golang:latest AS server-builder
 
 WORKDIR /build
 
