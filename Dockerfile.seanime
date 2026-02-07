@@ -28,9 +28,10 @@ COPY . .
 
 # Copy the built web assets from the previous stage into a `web` folder at the
 # repository root. The Go embed directive in main.go (`//go:embed all:web`)
-# expects these files to be present under `web` when compiling.
-RUN mkdir -p web && \
-    cp -r /usr/src/app/seanime-web/out/* web/
+# expects these files to be present under `web` when compiling. Using COPY with
+# --from ensures we copy from the web-builder stage rather than relying on a
+# path that doesn't exist in this build stage.
+COPY --from=web-builder /usr/src/app/seanime-web/out ./web
 
 # Build the statically linked Seanime binary. We use `-trimpath` and strip
 # debugging information to reduce size. Tags and flags can be adjusted if
