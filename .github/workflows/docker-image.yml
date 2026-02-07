@@ -31,6 +31,8 @@ jobs:
       - uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile.seanime  # or just 'Dockerfile' if that’s the name you use
+          file: Dockerfile.seanime
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ghcr.io/${{ github.repository_owner }}/seanime:latest
+
