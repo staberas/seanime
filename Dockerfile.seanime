@@ -17,7 +17,6 @@ WORKDIR /usr/src/app/seanime-web
 RUN npm install --no-fund --no-audit && \
     npm run build
 
-
 ## Stage 2: Build the Go server
 # Use the latest Go image and cross‑compile for the target platform.  The
 # --platform=$TARGETPLATFORM directive instructs Buildx to set the proper
