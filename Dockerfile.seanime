@@ -1,7 +1,7 @@
 # This Dockerfile builds and packages the Seanime media server and web interface
 # into a single container image. It follows the build steps described in
 # the repository's DEVELOPMENT_AND_BUILD.md, using a multi‑stage build to
-# minimize the final image size.
+# minimize the final image size. 
 
 ## Stage 1: Build the web interface with Node
 FROM --platform=$BUILDPLATFORM node:20-alpine AS web-builder
