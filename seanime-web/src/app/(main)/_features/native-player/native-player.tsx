@@ -117,6 +117,17 @@ export function NativePlayer() {
                     break
                 case "abort-open":
                     log.info("Abort open event received", { payload })
+                    if (!(payload as string)) {
+                        setMiniPlayer(true)
+                        setState(draft => {
+                            draft.active = false
+                            draft.loadingState = null
+                            draft.playbackInfo = null
+                            draft.playbackError = null
+                            return
+                        })
+                        break
+                    }
                     setState(draft => {
                         draft.loadingState = "An error occurred while loading the stream: " + ((payload as string) || "Unknown error")
                         draft.playbackError = payload as string
@@ -168,6 +179,9 @@ export function NativePlayer() {
     //
 
     function handleTerminateStream() {
+        const playbackId = state.playbackInfo?.id || ""
+        const playbackType = state.playbackInfo?.streamType || ""
+
         // Clean up player first
         if (videoElement) {
             log.info("Cleaning up media")
@@ -194,6 +208,12 @@ export function NativePlayer() {
             payload: {
                 clientId: clientId,
                 type: "video-terminated",
+                payload: {
+                    id: playbackId,
+                    clientId: clientId,
+                    playerType: "native",
+                    playbackType: playbackType,
+                },
             },
         })
     }

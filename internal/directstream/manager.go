@@ -50,7 +50,12 @@ type (
 
 		// ---------- Playback State ---------- //
 
-		currentStream mo.Option[Stream] // The current stream being played
+		currentStream         mo.Option[Stream] // The current stream being played
+		currentPlaybackID     string
+		currentPlaybackClient string
+		preparingClientID     string
+		preparationCanceled   bool
+		preparationCancelFunc func()
 
 		// \/ Stream playback
 		// This is set by [SetStreamEpisodeCollection]

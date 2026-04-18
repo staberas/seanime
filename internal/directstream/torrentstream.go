@@ -81,6 +81,7 @@ func (s *TorrentStream) LoadPlaybackInfo() (ret *nativeplayer.PlaybackInfo, err 
 		// If the content type is an EBML content type, we can create a metadata parser
 		if isEbmlContent(s.LoadContentType()) {
 			reader := torrentutil.NewReadSeeker(s.torrent, s.file, s.logger)
+			defer reader.Close()
 			parser := mkvparser.NewMetadataParser(reader, s.logger)
 			metadata := parser.GetMetadata(context.Background())
 			if metadata.Error != nil {
@@ -150,21 +151,34 @@ func (s *TorrentStream) GetStreamHandler() http.Handler {
 			_ = tr.Close()
 		}()
 
+		playbackCtx := s.manager.playbackCtx
+		if playbackCtx == nil {
+			playbackCtx = r.Context()
+		}
+		serveCtx, cancelServe := context.WithCancel(playbackCtx)
+		stopRequestCancel := context.AfterFunc(r.Context(), cancelServe)
+		defer func() {
+			stopRequestCancel()
+			cancelServe()
+		}()
+
 		ra, ok := handleRange(w, r, tr, name, size)
 		if !ok {
 			return
 		}
 
-		go func() {
-			if _, ok := s.playbackInfo.MkvMetadataParser.Get(); ok {
-				// Start a subtitle stream from the current position
-				subReader := s.file.NewReader()
-				subReader.SetResponsive()
-				s.StartSubtitleStream(s, s.manager.playbackCtx, subReader, ra.Start)
-			}
-		}()
+		if ra.Start > 0 {
+			go func(offset int64, subtitleCtx context.Context) {
+				if _, ok := s.playbackInfo.MkvMetadataParser.Get(); ok {
+					// Start a subtitle stream from the current position
+					subReader := s.file.NewReader()
+					subReader.SetResponsive()
+					s.StartSubtitleStream(s, subtitleCtx, subReader, offset)
+				}
+			}(ra.Start, serveCtx)
+		}
 
-		serveContentRange(w, r, s.manager.playbackCtx, tr, name, size, s.LoadContentType(), ra)
+		serveContentRange(w, r, serveCtx, tr, name, size, s.LoadContentType(), ra)
 	})
 }
 
@@ -188,9 +202,6 @@ type PlayTorrentStreamOptions struct {
 
 // PlayTorrentStream is used by a module to load a new torrent stream.
 func (m *Manager) PlayTorrentStream(ctx context.Context, opts PlayTorrentStreamOptions) (chan struct{}, error) {
-	m.playbackMu.Lock()
-	defer m.playbackMu.Unlock()
-
 	episodeCollection, err := anime.NewEpisodeCollection(anime.NewEpisodeCollectionOptions{
 		AnimeMetadata:       nil,
 		Media:               opts.Media,

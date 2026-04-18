@@ -284,8 +284,7 @@ type PlayNakamaStreamOptions struct {
 
 // PlayNakamaStream is used by a module to load a new nakama stream.
 func (m *Manager) PlayNakamaStream(ctx context.Context, opts PlayNakamaStreamOptions) error {
-	m.playbackMu.Lock()
-	defer m.playbackMu.Unlock()
+	m.ResetOpenState(opts.ClientId)
 
 	episodeCollection, err := anime.NewEpisodeCollection(anime.NewEpisodeCollectionOptions{
 		AnimeMetadata:       nil,

@@ -746,9 +746,14 @@ func (vc *VideoCore) listenToClientEvents() {
 			marshaled, _ := json.Marshal(clientEvent.Payload)
 			// Unmarshal the player event
 			if err := json.Unmarshal(marshaled, &playerEvent); err == nil {
+				eventClientID := playerEvent.ClientId
+				if eventClientID == "" {
+					eventClientID = clientEvent.ClientID
+				}
+
 				// Validate that the event is from the current client
 				currentState, hasState := vc.GetPlaybackState()
-				if hasState && clientEvent.ClientID != "" && clientEvent.ClientID != currentState.ClientId {
+				if hasState && eventClientID != "" && eventClientID != currentState.ClientId {
 					continue
 				}
 
@@ -939,8 +944,43 @@ func (vc *VideoCore) listenToClientEvents() {
 						})
 					}
 				case PlayerEventVideoTerminated:
-					// No payload
-					vc.PushEvent(&VideoTerminatedEvent{})
+					payload := &clientVideoTerminatedPayload{}
+					_ = playerEvent.UnmarshalAs(payload)
+					if payload.ClientId != "" {
+						eventClientID = payload.ClientId
+					}
+
+					event := &VideoTerminatedEvent{}
+					if state, ok := vc.GetPlaybackState(); ok {
+						playbackID := state.PlaybackInfo.Id
+						if payload.ID != "" {
+							playbackID = payload.ID
+						}
+						clientID := state.ClientId
+						if eventClientID != "" {
+							clientID = eventClientID
+						}
+						playerType := state.PlayerType
+						if payload.PlayerType != "" {
+							playerType = payload.PlayerType
+						}
+						playbackType := state.PlaybackInfo.PlaybackType
+						if payload.PlaybackType != "" {
+							playbackType = payload.PlaybackType
+						}
+						event.identify(playbackID, clientID, playerType, playbackType)
+					} else if eventClientID != "" {
+						playerType := payload.PlayerType
+						if playerType == "" {
+							playerType = NativePlayer
+						}
+						event.identify(payload.ID, eventClientID, playerType, payload.PlaybackType)
+					}
+					select {
+					case vc.eventBus <- event:
+					default:
+						vc.logger.Warn().Msg("videcore: Event bus full, dropping video terminated event")
+					}
 					vc.clearPlayback()
 				case PlayerEventSubtitleFileUploaded:
 					payload := &clientSubtitleFileUploadedPayload{}
