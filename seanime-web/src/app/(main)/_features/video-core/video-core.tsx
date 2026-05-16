@@ -602,6 +602,8 @@ const PlayerContent = React.memo<PlayerContentProps>(({
 
 PlayerContent.displayName = "PlayerContent"
 
+const PLAYBACK_STALL_TIMEOUT_MS = 12_000
+
 export interface VideoCoreProps {
     id: string
     state: VideoCoreLifecycleState
@@ -619,6 +621,7 @@ export interface VideoCoreProps {
     onSeeking?: () => void
     onSeeked?: (time: number) => void
     onError?: (error: string) => void
+    onStalled?: (reason: string) => void
     onPlaybackRateChange?: () => void
     // onFileUploaded: (data: { name: string, content: string }) => void
     onVideoSourceChange?: ((source: VideoCore_VideoSource) => void) | undefined
@@ -648,6 +651,7 @@ export function VideoCore(props: VideoCoreProps) {
         onSeeking,
         onSeeked,
         onError,
+        onStalled,
         onPlaybackRateChange,
         // onFileUploaded,
         inline = false,
@@ -703,6 +707,7 @@ export function VideoCore(props: VideoCoreProps) {
 
     const videoCompletedRef = useRef(false)
     const currentPlaybackRef = useRef<string | null>(null)
+    const stalledPlaybackRef = useRef<string | null>(null)
 
     const [, setContainerElement] = useAtom(vc_containerElement)
 
@@ -840,7 +845,7 @@ export function VideoCore(props: VideoCoreProps) {
     }, [state.active, state.playbackInfo?.id])
 
     // Merge refs
-    const combineRef = (instance: HTMLVideoElement | null) => {
+    const combineRef = React.useCallback((instance: HTMLVideoElement | null) => {
         videoRef.current = instance
         if (mRef) {
             mRef.current = instance
@@ -854,12 +859,12 @@ export function VideoCore(props: VideoCoreProps) {
         }
         videoResizeTargetRef.current = instance
         setVideoElement(instance)
-    }
+    }, [mRef, setVideoElement])
 
-    const combineContainerRef = (instance: HTMLDivElement | null) => {
+    const combineContainerRef = React.useCallback((instance: HTMLDivElement | null) => {
         containerRef.current = instance
         setContainerElement(instance)
-    }
+    }, [setContainerElement])
 
     // actions
     function togglePlay() {
@@ -876,15 +881,7 @@ export function VideoCore(props: VideoCoreProps) {
 
     function onAudioChange() {
         log.info("Audio changed", videoRef.current?.audioTracks)
-        if (videoRef.current?.audioTracks) {
-            for (let i = 0; i < videoRef.current.audioTracks.length; i++) {
-                const track = videoRef.current.audioTracks[i]
-                if (track.enabled) {
-                    audioManager?.selectTrack(Number(track.id))
-                    break
-                }
-            }
-        }
+        audioManager?.syncSelectedTrack()
         action({ type: "seek", payload: { time: -1 } })
     }
 
@@ -978,7 +975,28 @@ export function VideoCore(props: VideoCoreProps) {
         streamType: streamType,
         onMediaDetached: onHlsMediaDetached,
         onFatalError: onHlsFatalError,
+        onStalled: err => onStalled?.(`HLS stalled: ${err.error?.message || err.details}`),
     })
+
+    React.useEffect(() => {
+        if (!state.playbackInfo?.id || !streamUrl || !buffering) return
+        if (!videoRef.current || videoRef.current.paused) return
+
+        const playbackId = state.playbackInfo.id
+        const startedAt = videoRef.current.currentTime
+        const timeout = window.setTimeout(() => {
+            const video = videoRef.current
+            if (!video || video.paused || video.readyState >= 3) return
+            if (Math.abs(video.currentTime - startedAt) >= 0.5) return
+
+            const stallKey = `${playbackId}:${startedAt.toFixed(1)}`
+            if (stalledPlaybackRef.current === stallKey) return
+            stalledPlaybackRef.current = stallKey
+            onStalled?.("Playback stalled while buffering")
+        }, PLAYBACK_STALL_TIMEOUT_MS)
+
+        return () => window.clearTimeout(timeout)
+    }, [state.playbackInfo?.id, streamUrl, buffering, onStalled])
 
     const [anime4kOption, setAnime4kOption] = useAtom(vc_anime4kOption)
 
@@ -1025,6 +1043,10 @@ export function VideoCore(props: VideoCoreProps) {
          */
         const nonLibassSubtitleTracks = state.playbackInfo?.subtitleTracks?.filter(t => !t.useLibassRenderer)
         if (nonLibassSubtitleTracks && nonLibassSubtitleTracks.length > 0) {
+            setSubtitleManager(p => {
+                if (p) p.destroy()
+                return null
+            })
             setMediaCaptionsManager(p => {
                 if (p) p.destroy()
                 return new MediaCaptionsManager({
@@ -1053,6 +1075,10 @@ export function VideoCore(props: VideoCoreProps) {
                 })
             })
         } else {
+            setMediaCaptionsManager(p => {
+                if (p) p.destroy()
+                return null
+            })
             setSubtitleManager(p => {
                 if (p) p.destroy()
                 return new VideoCoreSubtitleManager({
@@ -1235,6 +1261,12 @@ export function VideoCore(props: VideoCoreProps) {
             clearTimeout(t)
         }
     }, [menuOpen])
+
+    React.useEffect(() => {
+        if (inline && isMiniPlayer) {
+            setIsMiniPlayer(false)
+        }
+    }, [isMiniPlayer, inline])
 
     let lastClickTime = React.useRef(0)
 
@@ -1478,6 +1510,24 @@ export function VideoCore(props: VideoCoreProps) {
     const setNotBusyTimeout = React.useRef<NodeJS.Timeout | null>(null)
     const lastPointerPosition = React.useRef({ x: 0, y: 0 })
     const isHoveringContainer = React.useRef(false)
+    const busyRef = React.useRef(busy)
+    const cursorBusyRef = React.useRef(cursorBusy)
+
+    React.useEffect(() => {
+        busyRef.current = busy
+    }, [busy])
+
+    React.useEffect(() => {
+        cursorBusyRef.current = cursorBusy
+    }, [cursorBusy])
+
+    React.useEffect(() => {
+        return () => {
+            if (setNotBusyTimeout.current) {
+                clearTimeout(setNotBusyTimeout.current)
+            }
+        }
+    }, [])
 
     const handleContainerPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
         const { x, y } = e.nativeEvent
@@ -1487,9 +1537,13 @@ export function VideoCore(props: VideoCoreProps) {
         if (setNotBusyTimeout?.current) {
             clearTimeout(setNotBusyTimeout.current)
         }
-        setBusy(true)
+        if (!busyRef.current) {
+            busyRef.current = true
+            setBusy(true)
+        }
         setNotBusyTimeout.current = setTimeout(() => {
-            if (!cursorBusy) {
+            if (!cursorBusyRef.current) {
+                busyRef.current = false
                 setBusy(false)
             }
         }, DELAY_BEFORE_NOT_BUSY)
@@ -1644,6 +1698,16 @@ export function VideoCore(props: VideoCoreProps) {
                     data-native-player-drawer
                     onMiniPlayerClick={() => {
                         togglePlay()
+                    }}
+                    onEscapeKeyDown={e => {
+                        e.preventDefault()
+                        if (!inline) {
+                            if (fullscreen) {
+                                setTimeout(() => {
+                                    setIsMiniPlayer(true)
+                                }, 800)
+                            } else setIsMiniPlayer(true)
+                        }
                     }}
                 >
                     <PlayerContent
