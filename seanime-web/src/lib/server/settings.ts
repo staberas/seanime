@@ -24,6 +24,7 @@ export const enum DEBRID_SERVICE {
     TORBOX = "torbox",
     REALDEBRID = "realdebrid",
     ALLDEBRID = "alldebrid",
+    PREMIUMIZE = "premiumize",
 }
 
 export const _gettingStartedSchema = z.object({
@@ -124,11 +125,15 @@ export const settingsSchema = z.object({
     vcTranslateTargetLanguage: z.string().optional().default(""),
     vcTranslateBaseUrl: z.string().optional().default(""),
     vcTranslateModel: z.string().optional().default(""),
+    mpvPrismLogging: z.boolean().optional().default(false),
+    mpvPrismEnabled: z.boolean().optional().default(false),
+    screenshotDir: z.string().optional().default(""),
     scannerUseLegacyMatching: z.boolean().optional().default(false),
     scannerConfig: z.string().optional().default(""),
     updateChannel: z.string().optional().default("github"),
     enableExtensionSecureMode: z.boolean().optional().default(false),
     defaultPlaybackSource: z.string().optional().default(""),
+    showTorrentAvailability: z.boolean().optional().default(false),
     hideAnimeSpoilers: z.boolean().optional().default(false),
     hideAnimeSpoilerThumbnails: z.boolean().optional().default(true),
     hideAnimeSpoilerTitles: z.boolean().optional().default(true),
@@ -168,6 +173,7 @@ export const getDefaultSettings = (data: z.infer<typeof gettingStartedSchema>): 
         updateChannel: "github",
         enableExtensionSecureMode: false,
         defaultPlaybackSource: "",
+        showTorrentAvailability: false,
     },
     nakama: {
         enabled: false,
@@ -207,6 +213,9 @@ export const getDefaultSettings = (data: z.infer<typeof gettingStartedSchema>): 
         vcTranslateTargetLanguage: "",
         vcTranslateBaseUrl: "",
         vcTranslateModel: "",
+        mpvPrismLogging: data.mpvPrismLogging ?? false,
+        mpvPrismEnabled: data.mpvPrismEnabled ?? false,
+        screenshotDir: data.screenshotDir || "",
     },
     discord: {
         enableRichPresence: data.enableRichPresence,

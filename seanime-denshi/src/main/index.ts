@@ -1,28 +1,89 @@
-const { app, BrowserWindow, Menu, Tray, ipcMain, shell, dialog, remote, net, protocol, nativeImage, screen } = require("electron")
-const path = require("path")
-const { spawn } = require("child_process")
-const fs = require("fs")
-const http = require("http")
-let stripAnsi
+import {
+    app,
+    BrowserWindow,
+    clipboard,
+    dialog,
+    ipcMain,
+    Menu,
+    nativeImage,
+    net,
+    powerSaveBlocker,
+    protocol,
+    screen,
+    shell,
+    Tray,
+    webContents,
+} from "electron"
+import { autoUpdater } from "electron-updater"
+import { spawn } from "node:child_process"
+import fs from "node:fs"
+import path from "node:path"
+import { setupChromiumFlags } from "./chromium-flags"
+import { DENSHI_SETTINGS_DEFAULTS, DenshiSettings, loadDenshiSettings, saveDenshiSettings } from "./denshi-settings"
+import {
+    allowedWebviewOrigins,
+    getLocalServerPort,
+    isAllowedLocalEmbedURL,
+    isDesktopServerReachable,
+    normalizeUpdateFeedURL,
+    startLocalServer,
+} from "./desktop-runtime"
+import { log, setupLogging } from "./logging"
+import { disposeMpvCore, initializeMpvCore, prepareMpvCore, registerMpvCoreIpc } from "./mpv-core"
+
+let stripAnsi: ((str: string) => string) | undefined
 import("strip-ansi").then(module => {
     stripAnsi = module.default
 })
-const { autoUpdater } = require("electron-updater")
-const log = require("electron-log/main")
-log.initialize()
+
+type ScopedLogger = {
+    info: (...args: unknown[]) => void
+    warn: (...args: unknown[]) => void
+    error: (...args: unknown[]) => void
+}
+
+function createScopedLogger(scope: string): ScopedLogger {
+    const prefix = `[${scope}]`
+    return {
+        info: (...args: unknown[]) => log.info(prefix, ...args),
+        warn: (...args: unknown[]) => log.warn(prefix, ...args),
+        error: (...args: unknown[]) => log.error(prefix, ...args),
+    }
+}
+
+const logger = {
+    app: createScopedLogger("App"),
+    startup: createScopedLogger("Startup"),
+    protocol: createScopedLogger("Protocol"),
+    updater: createScopedLogger("Updater"),
+    server: createScopedLogger("Server"),
+    window: createScopedLogger("Window"),
+    ipc: createScopedLogger("IPC"),
+    settings: createScopedLogger("Settings"),
+    power: createScopedLogger("Power"),
+    cast: createScopedLogger("Cast"),
+}
+
+function formatError(value: unknown): string {
+    if (value instanceof Error) {
+        return value.stack || `${value.name}: ${value.message}`
+    }
+
+    if (typeof value === "string") {
+        return value
+    }
+
+    try {
+        return JSON.stringify(value) ?? String(value)
+    }
+    catch {
+        return String(value)
+    }
+}
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Settings
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-const DENSHI_SETTINGS_DEFAULTS = {
-    minimizeToTray: true,
-    openInBackground: false,
-    openAtLaunch: false,
-    updateChannel: "github",
-    windowBounds: null,
-    windowMaximized: true,
-}
 
 const MAIN_WINDOW_DEFAULT_BOUNDS = {
     width: 800,
@@ -31,37 +92,18 @@ const MAIN_WINDOW_DEFAULT_BOUNDS = {
 
 const MIN_VISIBLE_WINDOW_EDGE = 120
 
-function getDenshiSettingsPath() {
-    return path.join(app.getPath("userData"), "denshi-settings.json")
+let denshiSettings: DenshiSettings = { ...DENSHI_SETTINGS_DEFAULTS }
+const mpvCoreSettings = {
+    get: () => denshiSettings,
+    updateLogging: (enabled: boolean) => {
+        denshiSettings = { ...denshiSettings, mpvPrismLogging: enabled }
+        saveDenshiSettings(denshiSettings)
+    },
 }
-
-function loadDenshiSettings() {
-    try {
-        const settingsPath = getDenshiSettingsPath()
-        if (fs.existsSync(settingsPath)) {
-            const data = JSON.parse(fs.readFileSync(settingsPath, "utf-8"))
-            return { ...DENSHI_SETTINGS_DEFAULTS, ...data }
-        }
-    } catch (err) {
-        log.error("[Denshi] Failed to load settings:", err)
-    }
-    return { ...DENSHI_SETTINGS_DEFAULTS }
-}
-
-function saveDenshiSettings(settings) {
-    try {
-        const settingsPath = getDenshiSettingsPath()
-        fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8")
-    } catch (err) {
-        log.error("[Denshi] Failed to save settings:", err)
-    }
-}
-
-let denshiSettings = { ...DENSHI_SETTINGS_DEFAULTS }
 let shouldMaximizeMainWindow = false
 
 // validates and returns safe window bounds based on the provided raw bounds and current display configurations
-function getSafeMainWindowPlacement(rawBounds) {
+function getSafeMainWindowPlacement(rawBounds: Partial<Electron.Rectangle> | null | undefined) {
     const width = Number(rawBounds?.width)
     const height = Number(rawBounds?.height)
     if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
@@ -121,7 +163,7 @@ function hideMainWindow() {
     saveMainWindowState()
     mainWindow.hide()
     if (process.platform === "darwin") {
-        app.dock.hide()
+        app.dock?.hide()
     }
 }
 
@@ -142,11 +184,12 @@ function showMainWindow() {
         }
 
         const currentBounds = mainWindow.getBounds()
-        if (currentBounds.x !== bounds.x
-            || currentBounds.y !== bounds.y
-            || currentBounds.width !== bounds.width
-            || currentBounds.height !== bounds.height) {
-            mainWindow.setBounds(bounds)
+        const targetBounds = { ...currentBounds, ...bounds }
+        if (currentBounds.x !== targetBounds.x
+            || currentBounds.y !== targetBounds.y
+            || currentBounds.width !== targetBounds.width
+            || currentBounds.height !== targetBounds.height) {
+            mainWindow.setBounds(targetBounds)
         }
 
         if (wasMaximized) {
@@ -167,219 +210,15 @@ function showMainWindow() {
     mainWindow.show()
     mainWindow.focus()
     if (process.platform === "darwin") {
-        app.dock.show()
+        app.dock?.show()
     }
 }
 
-const _isRsbuildFrontend = true
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Chromium flags
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-function setupChromiumFlags() {
-    app.commandLine.appendSwitch("no-zygote")
-
-    app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required")
-    app.commandLine.appendSwitch("force_high_performance_gpu")
-
-    app.commandLine.appendSwitch("disk-cache-size", (400 * 1000 * 1000).toString())
-    app.commandLine.appendSwitch("force-effective-connection-type", "4g")
-
-    // Disable features that can interfere with playback
-    app.commandLine.appendSwitch("disable-features", [
-        "WidgetLayering",
-        "ColorProviderRedirection",
-        "WebContentsForceDarkMode",
-        "HardwareMediaKeyHandling"
-    ].join(","))
-
-    // Hardware acceleration and GPU optimizations
-    app.commandLine.appendSwitch("force-high-performance-gpu")
-    // app.commandLine.appendSwitch('enable-gpu-rasterization');
-    app.commandLine.appendSwitch("enable-zero-copy")
-    app.commandLine.appendSwitch("enable-hardware-overlays", "single-fullscreen,single-on-top,underlay")
-    app.commandLine.appendSwitch("ignore-gpu-blocklist")
-
-    // Video-specific optimizations
-    app.commandLine.appendSwitch("enable-accelerated-video-decode")
-
-    // Enable advanced features
-    app.commandLine.appendSwitch("enable-features", [
-        "WebAssemblyLazyCompilation",
-        "ThrottleDisplayNoneAndVisibilityHiddenCrossOriginIframes",
-        "CanvasOopRasterization",
-        "UseSkiaRenderer",
-        "PlatformEncryptedDolbyVision",
-    ].join(","))
-
-    app.commandLine.appendSwitch("enable-unsafe-webgpu")
-    app.commandLine.appendSwitch("enable-gpu-rasterization")
-    app.commandLine.appendSwitch("enable-oop-rasterization")
-
-    // Background processing optimizations
-    app.commandLine.appendSwitch("disable-background-timer-throttling")
-    app.commandLine.appendSwitch("disable-backgrounding-occluded-windows")
-    app.commandLine.appendSwitch("disable-renderer-backgrounding")
-    app.commandLine.appendSwitch("disable-background-media-suspend")
-
-    app.commandLine.appendSwitch("double-buffer-compositing")
-    app.commandLine.appendSwitch("disable-direct-composition-video-overlays")
-
-    if (process.platform === "linux") {
-        log.info(`Passing --gtk-version=3 to Electron`)
-        app.commandLine.appendSwitch("gtk-version", "3")
-    }
-}
-
-// Setup update events for logging
-autoUpdater.logger = log
-log.transports.file.level = "debug"
-
-// Redirect console logging to electron-log
-console.log = log.info
-console.error = log.error
-
-
+setupLogging()
+setupChromiumFlags()
 const _development = process.env.NODE_ENV === "development"
-const LOCAL_EMBED_HOST = "127.0.0.1"
-const DESKTOP_SERVER_HOST = "127.0.0.1"
-const DESKTOP_SERVER_DEFAULT_PORT = 43211
-const DESKTOP_SERVER_DEV_PORT = 43000
+const _isRsbuildFrontend = true
 const DEFAULT_UPDATE_FEED_URL = "https://github.com/5rahim/seanime/releases/latest/download"
-
-function isAllowedLocalEmbedURL(rawURL) {
-    if (!localServerPort) {
-        return false
-    }
-
-    try {
-        const parsed = new URL(rawURL)
-        return parsed.protocol === "http:"
-            && parsed.hostname === LOCAL_EMBED_HOST
-            && parsed.port === String(localServerPort)
-            && parsed.pathname.startsWith("/player/")
-    } catch {
-        return false
-    }
-}
-
-function normalizeUpdateFeedURL(candidate, fallbackURL) {
-    try {
-        const parsed = new URL(candidate)
-        if (parsed.protocol !== "https:" || !parsed.host) {
-            throw new Error("update feeds must use https")
-        }
-
-        return parsed.toString()
-    } catch (error) {
-        log.warn(`[Denshi] Ignoring update feed URL ${candidate}: ${error.message}`)
-        return fallbackURL
-    }
-}
-
-function getDesktopServerPort() {
-    if (_development) {
-        return DESKTOP_SERVER_DEV_PORT
-    }
-
-    const envPort = Number.parseInt(process.env.SEANIME_SERVER_PORT || "", 10)
-    if (Number.isInteger(envPort) && envPort > 0) {
-        return envPort
-    }
-
-    return DESKTOP_SERVER_DEFAULT_PORT
-}
-
-function getDesktopServerBaseUrl() {
-    return `http://${DESKTOP_SERVER_HOST}:${getDesktopServerPort()}`
-}
-
-async function isDesktopServerReachable() {
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 1000)
-
-    try {
-        const response = await net.fetch(`${getDesktopServerBaseUrl()}/api/v1/status`, {
-            signal: controller.signal,
-        })
-        return response.ok
-    } catch {
-        return false
-    } finally {
-        clearTimeout(timeoutId)
-    }
-}
-
-// const _development = false;
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Local server for youtube player embeds
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-let localServerPort
-const allowedWebviewOrigins = new Set()
-
-// Start local server for youtube player embeds
-// Used by webviews inside React to load youtube embed and bypass 153 errors
-function startLocalServer() {
-    const server = http.createServer((req, res) => {
-        // serve /player/:id
-        const match = req.url.match(/^\/player\/([\w-]+)/)
-        if (match) {
-            const id = match[1]
-            let url = `https://www.youtube-nocookie.com/embed/${id}?autoplay=1&enablejsapi=1&autoplay=1&playsinline=1&modestbranding=1&rel=0e`
-            if (id.startsWith("compact_")) {
-                url = `https://www.youtube-nocookie.com/embed/${id.substring(8)}?autoplay=1&controls=0&mute=1&disablekb=1&loop=1&vq=medium&playlist=${id.substring(8)}&cc_lang_pref=ja&enablejsapi=true`
-            }
-            if (id.startsWith("banner_")) {
-                url = `https://www.youtube-nocookie.com/embed/${id.substring(7)}?autoplay=1&controls=0&mute=1&disablekb=1&loop=1&playlist=${id.substring(7)}&cc_lang_pref=ja&enablejsapi=true`
-            }
-            const html = `
-        <!DOCTYPE html>
-        <html lang="en">
-          <head>
-    <style>
-      html, body {
-        margin: 0;
-        padding: 0;
-        height: 100%;
-        background-color: black;
-      }
-      iframe {
-        position: absolute;
-        inset: 0;       /* top:0; right:0; bottom:0; left:0 */
-        width: 100%;
-        height: 100%;
-        border: none;
-      }
-    </style>
-  </head>
-        <body style="margin:0;background:black;">
-          <iframe
-            src="${url}"
-            allow="autoplay; encrypted-media; picture-in-picture"
-            allowfullscreen
-            >
-          </iframe>
-        </body>
-        </html>
-      `
-            res.writeHead(200, { "Content-Type": "text/html" })
-            res.end(html)
-            return
-        }
-
-        res.writeHead(404)
-        res.end("Not found")
-    })
-
-    server.listen(0) // random free port
-    const port = server.address().port
-    console.log(`Local server running at http://127.0.0.1:${port}`)
-    localServerPort = port
-    return port
-}
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Custom protocol for web content
@@ -395,8 +234,8 @@ function setupCustomProtocol() {
             supportFetchAPI: true,
             corsEnabled: true,
             stream: true,
-        }
-    }
+        },
+    },
     ])
 }
 
@@ -407,10 +246,10 @@ setupCustomProtocol()
 function setupAppProtocol() {
     if (_development) return
 
-    const webPath = path.join(__dirname, "../web-denshi")
+    const webPath = path.join(app.getAppPath(), "web-denshi")
 
     if (!_isRsbuildFrontend) {
-        protocol.handle("app", (request) => {
+        protocol.handle("app", (request: Request) => {
             const requestUrl = new URL(request.url)
             let urlPath = requestUrl.pathname
 
@@ -444,12 +283,12 @@ function setupAppProtocol() {
             }
 
             // fallback to root index.html
-            log.warn(`[Protocol] Fallback for ${request.url}, serving index.html`) // Added a log
+            logger.protocol.warn("Route fallback; serving index.html", request.url)
             const fallbackPath = path.join(webPath, "index.html")
             return net.fetch(`file://${fallbackPath}`)
         })
     } else {
-        protocol.handle("app", async (request) => {
+        protocol.handle("app", async (request: Request) => {
             const requestUrl = new URL(request.url)
             const urlPath = requestUrl.pathname
             let filePath = path.join(webPath, urlPath)
@@ -480,7 +319,7 @@ function setupAppProtocol() {
                 })
             }
 
-            console.error(`[App Protocol] 404 Not Found: ${urlPath}`)
+            logger.protocol.warn("Asset not found", urlPath)
             return new Response("Not Found", { status: 404 })
         })
     }
@@ -491,33 +330,33 @@ function setupAppProtocol() {
 /////////////////
 
 const __CAST_ENABLED__ = false
-const CastSender = __CAST_ENABLED__ ? require("./cast/sender").CastSender : null
-let castSender = null
+const CastSender = __CAST_ENABLED__ ? require(path.join(app.getAppPath(), "src/cast/sender.js")).CastSender : null
+let castSender: any = null
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Startup logs
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-function logStartupEvent(stage, detail = "") {
-    const message = `[STARTUP] ${stage}: ${detail}`
-    log.info(message)
-    // console.info(message);
+function logStartupEvent(stage: string, detail?: unknown) {
+    if (detail === undefined || detail === "") {
+        logger.startup.info(stage)
+        return
+    }
+
+    logger.startup.info(`${stage}:`, detail)
 }
 
 // Global error handlers to catch unhandled exceptions
-process.on("uncaughtException", (error) => {
-    log.error("Uncaught Exception:", error)
+process.on("uncaughtException", (error: Error) => {
+    logger.app.error("Uncaught exception", formatError(error))
 
     if (app.isReady()) {
         dialog.showErrorBox("An error occurred", `Uncaught Exception: ${error.message}\n\nCheck the logs for more details.`)
     }
-
-    logStartupEvent("UNCAUGHT EXCEPTION", error.stack || error.message)
 })
 
-process.on("unhandledRejection", (reason, promise) => {
-    log.error("Unhandled Rejection at:", promise, "reason:", reason)
-    logStartupEvent("UNHANDLED REJECTION", reason?.stack || reason?.message || JSON.stringify(reason))
+process.on("unhandledRejection", (reason: unknown) => {
+    logger.app.error("Unhandled rejection", formatError(reason))
 })
 
 // Dumps important environment information for debugging
@@ -544,10 +383,11 @@ function logEnvironmentInfo() {
                 const binariesFiles = fs.readdirSync(binariesDir)
                 logStartupEvent("Binaries directory contents", JSON.stringify(binariesFiles))
             } else {
-                logStartupEvent("ERROR", "Binaries directory not found")
+                logger.startup.warn("Binaries directory not found", binariesDir)
             }
-        } catch (err) {
-            logStartupEvent("ERROR reading resources", err.message)
+        }
+        catch (err: any) {
+            logger.startup.error("Failed to read resources directory", formatError(err))
         }
     }
 
@@ -558,70 +398,71 @@ function logEnvironmentInfo() {
 
         const webPath = path.join(appPath, "web-denshi")
         if (!fs.existsSync(webPath)) {
-            logStartupEvent("ERROR", "web-denshi directory not found in app path")
+            logger.startup.warn("web-denshi directory not found", webPath)
         }
-    } catch (err) {
-        logStartupEvent("ERROR reading app directory", err.message)
+    }
+    catch (err: any) {
+        logger.startup.error("Failed to inspect app directory", formatError(err))
     }
 }
 
-let mainWindow = null
-let splashScreen = null
-let crashScreen = null
-let tray = null
-let serverProcess = null
+let mainWindow: Electron.BrowserWindow | null = null
+let splashScreen: Electron.BrowserWindow | null = null
+let crashScreen: Electron.BrowserWindow | null = null
+let tray: Electron.Tray | null = null
+let serverProcess: import("node:child_process").ChildProcess | null = null
 let isShutdown = false
 let serverStarted = false
 let mainWindowStartupReady = false
 let updateDownloaded = false
-let serverRestartPromise = null
+let serverRestartPromise: Promise<void> | null = null
 
-app.on("child-process-gone", (event, details) => {
-    log.warn("[Denshi] Child process gone:", JSON.stringify(details))
+app.on("child-process-gone", (event: Electron.Event, details: any) => {
+    logger.app.warn("Child process gone", details)
 })
 
 // Setup autoUpdater events with improved error handling
 autoUpdater.on("checking-for-update", () => {
-    autoUpdater.logger.info("Checking for update...")
+    logger.updater.info("Checking for update")
 })
 
-autoUpdater.on("update-available", (info) => {
-    autoUpdater.logger.info("Update available:", info)
+autoUpdater.on("update-available", (info: any) => {
+    logger.updater.info("Update available", info)
     if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send("update-available", {
-            version: info.version, releaseDate: info.releaseDate, files: info.files
+            version: info.version, releaseDate: info.releaseDate, files: info.files,
         })
     }
 })
 
-autoUpdater.on("update-not-available", (info) => {
-    autoUpdater.logger.info("Update not available:", info)
+autoUpdater.on("update-not-available", (info: any) => {
+    logger.updater.info("Update not available", info)
 })
 
-autoUpdater.on("download-progress", (progressObj) => {
-    autoUpdater.logger.info(`Download progress: ${progressObj.percent}%`)
+autoUpdater.on("download-progress", (progressObj: any) => {
+    logger.updater.info("Download progress", `${Number(progressObj.percent).toFixed(1)}%`)
     if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send("download-progress", {
-            percent: progressObj.percent, bytesPerSecond: progressObj.bytesPerSecond, transferred: progressObj.transferred, total: progressObj.total
+            percent: progressObj.percent, bytesPerSecond: progressObj.bytesPerSecond, transferred: progressObj.transferred, total: progressObj.total,
         })
     }
 })
 
-autoUpdater.on("update-downloaded", (info) => {
-    autoUpdater.logger.info("Update downloaded:", info)
+autoUpdater.on("update-downloaded", (info: any) => {
+    logger.updater.info("Update downloaded", info)
     updateDownloaded = true
     if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send("update-downloaded", {
-            version: info.version, releaseDate: info.releaseDate, files: info.files
+            version: info.version, releaseDate: info.releaseDate, files: info.files,
         })
     }
 })
 
-autoUpdater.on("error", (err) => {
-    autoUpdater.logger.error("Error in auto-updater:", err)
+autoUpdater.on("error", (err: Error) => {
+    logger.updater.error("Auto-updater error", formatError(err))
     if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send("update-error", {
-            code: err.code || "unknown", message: err.message, stack: err.stack
+            code: (err as any).code || "unknown", message: err.message, stack: err.stack,
         })
     }
 })
@@ -640,7 +481,7 @@ if (!gotTheLock) {
         app.quit()
     }
 } else {
-    app.on("second-instance", (event, commandLine, workingDirectory, additionalData) => {
+    app.on("second-instance", (event: Electron.Event, commandLine: string[], workingDirectory: string, additionalData: any) => {
         if (additionalData && additionalData.development) return
         if (!serverStarted) return
         // tried to run a second instance, focus the window.
@@ -661,32 +502,30 @@ if (!gotTheLock) {
 function createTray() {
     const iconName = process.platform === "darwin" ? "18x18.png" : "icon.png"
 
-    let iconPath = path.join(__dirname, "../assets", iconName)
-    if (_development) {
-        iconPath = path.join(app.getAppPath(), "assets", iconName)
-    }
+    const iconPath = path.join(app.getAppPath(), "assets", iconName)
     const icon = nativeImage.createFromPath(iconPath)
     tray = new Tray(icon)
 
     const contextMenu = Menu.buildFromTemplate([{
         id: "toggle_visibility", label: "Toggle Visibility", click: () => {
             if (!serverStarted) return
+            if (!mainWindow || mainWindow.isDestroyed()) return
             if (mainWindow.isVisible()) {
                 hideMainWindow()
             } else {
                 showMainWindow()
             }
-        }
+        },
     }, ...(process.platform === "darwin" ? [{
         id: "accessory_mode", label: "Remove from Dock", click: () => {
-            app.dock.hide()
-        }
-    }
+            app.dock?.hide()
+        },
+    },
     ] : []), {
         id: "quit", label: "Quit Seanime", click: () => {
             cleanupAndExit()
-        }
-    }
+        },
+    },
     ])
 
     tray.setToolTip("Seanime")
@@ -697,6 +536,7 @@ function createTray() {
 
     tray.on("click", () => {
         if (!serverStarted) return
+        if (!mainWindow || mainWindow.isDestroyed()) return
         if (mainWindow.isVisible()) {
             hideMainWindow()
         } else {
@@ -706,7 +546,7 @@ function createTray() {
 
     if (process.platform === "darwin") {
         tray.on("right-click", () => {
-            tray.popUpContextMenu(contextMenu)
+            tray?.popUpContextMenu(contextMenu)
         })
     }
 }
@@ -715,10 +555,10 @@ function createTray() {
 // Seanime server
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-async function launchSeanimeServer(isRestart) {
-    return new Promise((resolve, reject) => {
+async function launchSeanimeServer(isRestart: boolean): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
         let startupResolved = false
-        let startupPollInterval = null
+        let startupPollInterval: NodeJS.Timeout | null = null
         let waitingForRenderer = false
 
         function clearStartupProbe() {
@@ -728,7 +568,7 @@ async function launchSeanimeServer(isRestart) {
             }
         }
 
-        function checkFinalizeStartup(source) {
+        function checkFinalizeStartup(source: string) {
             if (startupResolved) {
                 return
             }
@@ -744,7 +584,7 @@ async function launchSeanimeServer(isRestart) {
             finalizeStartup(source)
         }
 
-        function finalizeStartup(source) {
+        function finalizeStartup(source: string) {
             if (startupResolved) {
                 return
             }
@@ -752,20 +592,18 @@ async function launchSeanimeServer(isRestart) {
             startupResolved = true
             clearStartupProbe()
 
-            console.log(`[Main] Server started via ${source}`)
+            logger.server.info("Startup finalized", { source, isRestart })
             serverStarted = true
             setTimeout(() => {
-                console.log("[Main] Server started timeout")
                 if (splashScreen && !splashScreen.isDestroyed()) {
                     splashScreen.close()
                     splashScreen = null
                 }
-                console.log("[Main] Server started close splash screen")
                 setTimeout(() => {
                     if (mainWindow && !mainWindow.isDestroyed()) {
                         if (denshiSettings.openInBackground) {
                             // Don't maximize or show
-                            log.info("[Denshi] Opened in background")
+                            logger.window.info("Opened in background")
                         } else {
                             showMainWindow()
                         }
@@ -787,8 +625,7 @@ async function launchSeanimeServer(isRestart) {
 
         // TEST ONLY: Check for -no-binary flag
         if (process.argv.includes("-no-binary")) {
-            logStartupEvent("SKIPPING SERVER LAUNCH", "Detected -no-binary flag")
-            console.log("[Main] Skipping server launch due to -no-binary flag")
+            logger.server.warn("Skipping launch because -no-binary is set")
             serverStarted = true // Assume server is "started" for UI flow
             // Resolve immediately to bypass server spawning
             if (splashScreen && !splashScreen.isDestroyed()) {
@@ -813,11 +650,11 @@ async function launchSeanimeServer(isRestart) {
             binaryName = `seanime-server-linux-${arch}`
         }
 
-        let binaryPath
+        let binaryPath: string
 
         if (_development) {
             // In development, look for binaries in the project directory
-            binaryPath = path.join(__dirname, "../binaries", binaryName)
+            binaryPath = path.join(app.getAppPath(), "binaries", binaryName)
         } else {
             // In production, use the resources path
             binaryPath = path.join(process.resourcesPath, "binaries", binaryName)
@@ -829,7 +666,7 @@ async function launchSeanimeServer(isRestart) {
         // Check if binary exists and is executable
         if (!fs.existsSync(binaryPath)) {
             const error = new Error(`Server binary not found at ${binaryPath}`)
-            logStartupEvent("ERROR", error.message)
+            logger.server.error("Server binary not found", binaryPath)
             return reject(error)
         }
 
@@ -837,19 +674,20 @@ async function launchSeanimeServer(isRestart) {
         if (process.platform !== "win32") {
             try {
                 fs.chmodSync(binaryPath, "755")
-            } catch (error) {
-                console.error(`Failed to make binary executable: ${error}`)
+            }
+            catch (error) {
+                logger.server.error("Failed to make binary executable", formatError(error))
             }
         }
 
         // Arguments
-        const args = []
+        const args: string[] = []
 
         // Development mode
         if (_development) {
             args.push("-port", "43000")
             if (process.env.TEST_DATADIR) {
-                console.log("[Main] TEST_DATADIR", process.env.TEST_DATADIR)
+                logger.server.info("Using TEST_DATADIR", process.env.TEST_DATADIR)
                 args.push("-datadir", process.env.TEST_DATADIR)
             } else {
                 const devDataDir = path.join(app.getPath("appData"), "Seanime-dev")
@@ -859,13 +697,16 @@ async function launchSeanimeServer(isRestart) {
 
         args.push("-desktop-sidecar", "true")
 
-        console.log("\x1b[32m[Main] Spawning server process\x1b[0m", { args, binaryPath })
+        logger.server.info("Spawning process", { args, binaryPath, isRestart })
 
         // Spawn the process
+        let proc: import("node:child_process").ChildProcess
         try {
-            serverProcess = spawn(binaryPath, args)
-        } catch (spawnError) {
-            console.error("[Main] Failed to spawn server process synchronously:", spawnError)
+            proc = spawn(binaryPath, args)
+            serverProcess = proc
+        }
+        catch (spawnError) {
+            logger.server.error("Failed to spawn process", formatError(spawnError))
             return reject(spawnError)
         }
 
@@ -874,32 +715,34 @@ async function launchSeanimeServer(isRestart) {
         }, 500)
         void probeServerStartup()
 
-        serverProcess.stdout.on("data", (data) => {
-            const dataStr = data.toString()
-            const lineStr = stripAnsi ? stripAnsi(dataStr) : dataStr
+        if (proc.stdout) {
+            proc.stdout.on("data", (data: any) => {
+                const dataStr = data.toString()
+                const lineStr = stripAnsi ? stripAnsi(dataStr) : dataStr
 
-            // // Check if mainWindow exists and is not destroyed
-            // if (mainWindow && !mainWindow.isDestroyed()) {
-            //     mainWindow.webContents.send('message', lineStr);
-            // }
+                // Check if the frontend is connected
+                if (!serverStarted && lineStr.includes("Client connected")) {
+                    checkFinalizeStartup("websocket client connection")
+                }
+            })
+        }
 
-            // Check if the frontend is connected
-            if (!serverStarted && lineStr.includes("Client connected")) {
-                checkFinalizeStartup("websocket client connection")
-            }
-        })
+        if (proc.stderr) {
+            proc.stderr.on("data", (data: Buffer | string) => {
+                const output = data.toString().trim()
+                if (output) {
+                    logger.server.error("stderr", stripAnsi ? stripAnsi(output) : output)
+                }
+            })
+        }
 
-        serverProcess.stderr.on("data", (data) => {
-            console.error(data.toString())
-        })
-
-        serverProcess.on("close", (code) => {
+        proc.on("close", (code: number | null) => {
             clearStartupProbe()
-            console.log(`[Main] Server process exited with code ${code}`)
+            logger.server.info("Process exited", { code })
 
             // If the server didn't start properly and we're not in the process of shutting down
             if (!startupResolved && !isShutdown) {
-                console.log("[Main] Server process exited before starting")
+                logger.server.error("Process exited before startup completed", { code })
                 reject(new Error(`Server process exited prematurely with code ${code} before starting.`))
 
                 // close splash screen and main window
@@ -927,9 +770,9 @@ async function launchSeanimeServer(isRestart) {
         })
 
         // Handle spawn errors
-        serverProcess.on("error", (err) => {
+        proc.on("error", (err: Error) => {
             clearStartupProbe()
-            console.error("[Main] Server process spawn error event:", err)
+            logger.server.error("Process error event", formatError(err))
             reject(err)
         })
     })
@@ -937,22 +780,22 @@ async function launchSeanimeServer(isRestart) {
 
 async function restartSeanimeServer() {
     if (serverRestartPromise) {
-        console.log("[Main] Restart already in progress, skipping duplicate request")
+        logger.server.info("Restart already in progress; reusing existing request")
         return serverRestartPromise
     }
 
     serverRestartPromise = (async () => {
         if (await isDesktopServerReachable()) {
-            console.log("[Main] Restart skipped because the desktop server is already reachable")
+            logger.server.info("Restart skipped; server is already reachable")
             return
         }
 
         const currentServerProcess = serverProcess
 
         if (currentServerProcess && !currentServerProcess.killed) {
-            console.log("[Main] Waiting for existing server process to exit before relaunching")
+            logger.server.info("Stopping existing process before relaunch")
 
-            await new Promise((resolve) => {
+            await new Promise<void>((resolve) => {
                 let settled = false
 
                 function finish() {
@@ -961,8 +804,8 @@ async function restartSeanimeServer() {
                     }
 
                     settled = true
-                    currentServerProcess.removeListener("close", finish)
-                    currentServerProcess.removeListener("error", finish)
+                    currentServerProcess?.removeListener("close", finish)
+                    currentServerProcess?.removeListener("error", finish)
 
                     if (serverProcess === currentServerProcess) {
                         serverProcess = null
@@ -976,14 +819,15 @@ async function restartSeanimeServer() {
 
                 try {
                     currentServerProcess.kill()
-                } catch (error) {
-                    console.error("[Main] Failed to kill server during restart:", error)
+                }
+                catch (error) {
+                    logger.server.error("Failed to stop process during restart", formatError(error))
                     finish()
                     return
                 }
 
                 setTimeout(() => {
-                    console.warn("[Main] Timed out waiting for server process to exit during restart")
+                    logger.server.warn("Timed out waiting for process to exit during restart")
                     finish()
                 }, 3000)
             })
@@ -1003,17 +847,17 @@ async function restartSeanimeServer() {
 // Main window
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-function showEditableContextMenu(webContents, params) {
+function showEditableContextMenu(webContents: Electron.WebContents, params: Electron.ContextMenuParams) {
     if (!params.isEditable) return
 
     const template = [
-        { role: "undo", enabled: params.editFlags.canUndo },
-        { role: "redo", enabled: params.editFlags.canRedo },
-        { type: "separator" },
-        { role: "cut", enabled: params.editFlags.canCut },
-        { role: "copy", enabled: params.editFlags.canCopy },
-        { role: "paste", enabled: params.editFlags.canPaste },
-        { role: "selectAll", enabled: params.editFlags.canSelectAll },
+        { role: "undo" as const, enabled: params.editFlags.canUndo },
+        { role: "redo" as const, enabled: params.editFlags.canRedo },
+        { type: "separator" as const },
+        { role: "cut" as const, enabled: params.editFlags.canCut },
+        { role: "copy" as const, enabled: params.editFlags.canCopy },
+        { role: "paste" as const, enabled: params.editFlags.canPaste },
+        { role: "selectAll" as const, enabled: params.editFlags.canSelectAll },
     ]
 
     Menu.buildFromTemplate(template).popup({
@@ -1027,21 +871,21 @@ function createMainWindow() {
     const savedPlacement = getSafeMainWindowPlacement(denshiSettings.windowBounds)
     shouldMaximizeMainWindow = savedPlacement.forceMaximize
 
-    const windowOptions = {
+    const windowOptions: Electron.BrowserWindowConstructorOptions = {
         ...savedPlacement.bounds, show: false,
         backgroundColor: "#111111",
         acceptFirstMouse: false,
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
-            sandbox: true,
-            preload: path.join(__dirname, "preload.js"),
+            sandbox: false,
+            preload: path.join(app.getAppPath(), "src/preload.mjs"),
             webSecurity: true,
             allowRunningInsecureContent: true,
             enableBlinkFeatures: "FontAccess, AudioVideoTracks",
-            backgroundThrottling: true,
+            backgroundThrottling: false,
             webviewTag: true,
-        }
+        },
     }
 
     // contextMenu({
@@ -1057,50 +901,90 @@ function createMainWindow() {
         windowOptions.titleBarStyle = "hidden"
     }
 
-    mainWindow = new BrowserWindow(windowOptions)
+    const win = new BrowserWindow(windowOptions)
+    mainWindow = win
 
-    mainWindow.webContents.on("context-menu", (event, params) => {
+    win.on("minimize", () => {
+        if (!win.isDestroyed()) {
+            win.webContents.send("window:minimized")
+        }
+    })
+
+    win.on("hide", () => {
+        if (!win.isDestroyed()) {
+            win.webContents.send("window:hidden")
+        }
+    })
+
+    win.on("maximize", () => {
+        if (!win.isDestroyed()) {
+            win.webContents.send("window:maximized")
+        }
+    })
+
+    win.on("unmaximize", () => {
+        if (!win.isDestroyed()) {
+            win.webContents.send("window:unmaximized")
+        }
+    })
+
+    win.on("enter-full-screen", () => {
+        if (!win.isDestroyed()) {
+            win.webContents.send("window:fullscreen", true)
+        }
+    })
+
+    win.on("leave-full-screen", () => {
+        if (!win.isDestroyed()) {
+            win.webContents.send("window:fullscreen", false)
+        }
+    })
+
+    win.webContents.on("context-menu", (event: Electron.Event, params: Electron.ContextMenuParams) => {
         if (!params.isEditable) return
 
         event.preventDefault()
-        showEditableContextMenu(mainWindow.webContents, params)
+        showEditableContextMenu(win.webContents, params)
     })
 
     // Hide the title bar on Windows
     if (process.platform === "win32" || process.platform === "linux") {
-        mainWindow.setMenuBarVisibility(false)
+        win.setMenuBarVisibility(false)
     }
 
-    mainWindow.on("render-process-gone", (event, details) => {
-        console.log("[Main] Render process gone", details)
-        log.error("[Denshi] Main window render process gone:", JSON.stringify(details))
+    win.webContents.on("render-process-gone", (event: Electron.Event, details: Electron.RenderProcessGoneDetails) => {
+        logger.window.error("Renderer process gone", details)
         if (crashScreen && !crashScreen.isDestroyed()) {
             crashScreen.show()
             crashScreen.webContents.send(
                 "crash",
-                `The desktop window stopped unexpectedly (${details.reason || "unknown reason"}${typeof details.exitCode === "number" ? `, exit code ${details.exitCode}` : ""}). The background server may still be running.`
+                `The desktop window stopped unexpectedly (${details.reason || "unknown reason"}${typeof details.exitCode === "number"
+                    ? `, exit code ${details.exitCode}`
+                    : ""}). The background server may still be running.`,
+                { isRendererCrash: true },
             )
         }
     })
 
-    mainWindow.webContents.on("will-attach-webview", (event, webPreferences, params) => {
+    win.webContents.on("will-attach-webview", (event: Electron.Event, webPreferences: Electron.WebPreferences, params: any) => {
         let isAllowed = false
         try {
             const parsed = new URL(params.src)
             if (isAllowedLocalEmbedURL(params.src) || allowedWebviewOrigins.has(parsed.origin)) {
                 isAllowed = true
             }
-        } catch (err) {
+        }
+        catch (err) {
         }
 
         if (!isAllowed) {
-            log.warn(`[Denshi] Blocked unexpected webview src ${params.src}`)
+            logger.window.warn("Blocked unexpected webview source", params.src)
             event.preventDefault()
             return
         }
 
         delete webPreferences.preload
-        delete webPreferences.preloadURL
+        delete (webPreferences as any).preloadURL
         delete params.preload
 
         webPreferences.nodeIntegration = false
@@ -1113,7 +997,11 @@ function createMainWindow() {
     })
 
 
-    mainWindow.webContents.setWindowOpenHandler(({ webContents, frameName, url }) => {
+    win.webContents.setWindowOpenHandler(({ frameName, url }: Electron.HandlerDetails) => {
+        // Allow DocumentPictureInPicture window requests which use about:blank
+        if (url === "about:blank") {
+            return { action: "allow" }
+        }
         // Open external links in the default browser
         if (url.startsWith("http://") || url.startsWith("https://")) {
             shell.openExternal(url)
@@ -1125,13 +1013,15 @@ function createMainWindow() {
         // For internal app:// (or file://) links, do not spawn a new renderer,
         // navigate the main window (or the opener) so it remains a single renderer.
         try {
-            const opener = webContents.fromId(frameName || 0) || mainWindow.webContents
+            const openerId = Number.parseInt(frameName, 10)
+            const opener = (!Number.isNaN(openerId) ? webContents.fromId(openerId) : null) || win.webContents
             // load in mainWindow instead of spawning new window
             if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.loadURL(url)
             }
-        } catch (e) {
-            console.warn("setWindowOpenHandler fallback loadURL failed", e)
+        }
+        catch (e) {
+            logger.window.warn("Failed to route internal window URL", formatError(e))
         }
 
         return { action: "deny" }
@@ -1141,19 +1031,19 @@ function createMainWindow() {
     if (_development) {
         // In development, load from the dev server
         logStartupEvent("Loading from dev server", "http://127.0.0.1:43210")
-        mainWindow.loadURL("http://127.0.0.1:43210")
-        // mainWindow.loadURL('chrome://gpu');
+        win.loadURL("http://127.0.0.1:43210")
+        // win.loadURL('chrome://gpu');
     } else {
         logStartupEvent("Loading production build with custom protocol")
-        mainWindow.loadURL("app://-")
+        win.loadURL("app://-")
     }
 
     // Development tools
     // if (_development) {
-    //     mainWindow.webContents.openDevTools();
+    //     win.webContents.openDevTools();
     // }
 
-    mainWindow.on("close", (event) => {
+    win.on("close", (event: Electron.Event) => {
         if (!isShutdown) {
             if (denshiSettings.minimizeToTray) {
                 event.preventDefault()
@@ -1173,20 +1063,24 @@ function createMainWindow() {
 function createSplashScreen() {
     logStartupEvent("Creating splash screen")
     splashScreen = new BrowserWindow({
-        width: 800, height: 600, frame: false, resizable: false, show: !denshiSettings.openInBackground, backgroundColor: "#0c0c0c", webPreferences: {
-            nodeIntegration: false, contextIsolation: true, sandbox: true, preload: path.join(__dirname, "preload.js")
-        }
+        width: 800, height: 600, frame: false, resizable: false, show: false, backgroundColor: "#070707", webPreferences: {
+            nodeIntegration: false, contextIsolation: true, sandbox: true,
+        },
     })
 
-    // Load the web content
-    if (_development) {
-        // In development, load from the dev server
-        logStartupEvent("Loading splash from dev server", "http://127.0.0.1:43210/splashscreen")
-        splashScreen.loadURL("http://127.0.0.1:43210/splashscreen")
-    } else {
-        logStartupEvent("Loading splash screen with custom protocol")
-        splashScreen.loadURL("app://-/splashscreen")
+    function showSplashScreen() {
+        if (denshiSettings.openInBackground || !splashScreen || splashScreen.isDestroyed() || splashScreen.isVisible()) {
+            return
+        }
+
+        splashScreen.show()
     }
+
+    splashScreen.once("ready-to-show", showSplashScreen)
+    setTimeout(showSplashScreen, 500)
+
+    logStartupEvent("Loading splash screen")
+    splashScreen.loadFile(path.join(app.getAppPath(), "src/splash.html"))
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1196,8 +1090,8 @@ function createSplashScreen() {
 function createCrashScreen() {
     crashScreen = new BrowserWindow({
         width: 800, height: 600, frame: false, resizable: false, show: false, webPreferences: {
-            nodeIntegration: false, contextIsolation: true, sandbox: true, preload: path.join(__dirname, "preload.js")
-        }
+            nodeIntegration: false, contextIsolation: true, sandbox: true, preload: path.join(app.getAppPath(), "src/preload.js"),
+        },
     })
 
     // Load the web content
@@ -1214,10 +1108,15 @@ function createCrashScreen() {
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 function cleanupAndExit() {
-    console.log("[Main] Cleaning up and exiting")
+    if (isShutdown) {
+        return
+    }
+
     isShutdown = true
+    logger.app.info("Shutdown started")
 
     saveMainWindowState()
+    disposeMpvCore()
 
     // Clean up cast
     if (__CAST_ENABLED__ && castSender) {
@@ -1227,12 +1126,13 @@ function cleanupAndExit() {
 
     // Kill server process first
     if (serverProcess) {
-        console.log("[Main] Killing server process")
+        logger.server.info("Stopping process for shutdown")
         try {
             serverProcess.kill()
             serverProcess = null
-        } catch (err) {
-            console.error("[Main] Error killing server process:", err)
+        }
+        catch (err) {
+            logger.server.error("Failed to stop process during shutdown", formatError(err))
         }
     }
 
@@ -1254,7 +1154,7 @@ async function fetchGithubStatus() {
         const timeoutId = setTimeout(() => controller.abort(), 5000)
 
         const response = await net.fetch("https://seanime.app/api/github-status", {
-            signal: controller.signal
+            signal: controller.signal,
         })
         clearTimeout(timeoutId)
 
@@ -1266,12 +1166,13 @@ async function fetchGithubStatus() {
 
         // url is reachable, status is "down"
         if (data.status === "down") {
-            log.warn(`[Denshi] App: Changing update channel to ${data.fallback}, reason: ${data.description}`)
+            logger.updater.warn("Using fallback update channel", { channel: data.fallback, reason: data.description })
             return { ok: false, fallback: data.fallback || "seanime" }
         }
 
         return { ok: true, fallback: "" }
-    } catch (err) {
+    }
+    catch (err) {
         return { ok: true, fallback: "" }
     }
 }
@@ -1280,8 +1181,21 @@ async function fetchGithubStatus() {
 app.whenReady().then(async () => {
     logStartupEvent("App ready")
 
-    // Load denshi settings early
+    // Load denshi settings early so environment variables are registered prior to DLL import
     denshiSettings = loadDenshiSettings()
+
+    prepareMpvCore(mpvCoreSettings)
+
+    try {
+        await initializeMpvCore()
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logger.app.error("Failed to initialize MpvCore", formatError(error))
+        dialog.showErrorBox("Seanime Denshi could not start MpvCore", message)
+        app.quit()
+        return
+    }
     if (_development) {
         denshiSettings.openInBackground = false
     }
@@ -1289,7 +1203,7 @@ app.whenReady().then(async () => {
     if (process.platform === "linux") {
         denshiSettings.openInBackground = false
     }
-    log.info("[Denshi] Loaded settings:", JSON.stringify(denshiSettings))
+    logger.settings.info("Loaded", denshiSettings)
 
     let currentUpdateChannel = denshiSettings.updateChannel
     const { ok, fallback } = await fetchGithubStatus()
@@ -1299,7 +1213,7 @@ app.whenReady().then(async () => {
     }
 
     const updateConfig = {
-        provider: "generic",
+        provider: "generic" as const,
         url: DEFAULT_UPDATE_FEED_URL,
         channel: "latest",
         allowPrerelease: false,
@@ -1320,9 +1234,10 @@ app.whenReady().then(async () => {
         updateConfig.url = normalizeUpdateFeedURL(process.env.UPDATES_URL, updateConfig.url)
     }
 
-    autoUpdater.setFeedURL(updateConfig)
+    autoUpdater.setFeedURL(updateConfig as any)
     autoUpdater.autoDownload = true
     autoUpdater.autoInstallOnAppQuit = true
+    autoUpdater.disableWebInstaller = true
 
     if (!_development && (process.platform === "darwin" || process.platform === "win32")) {
         app.setLoginItemSettings({
@@ -1330,13 +1245,10 @@ app.whenReady().then(async () => {
         })
     }
 
-    // Set up Chromium flags for better video playback
-    setupChromiumFlags()
-
     // Log environment information
     logEnvironmentInfo()
 
-    ipcMain.on("startup:renderer-ready", (event) => {
+    ipcMain.on("startup:renderer-ready", (event: Electron.IpcMainEvent) => {
         if (!mainWindow || event.sender !== mainWindow.webContents || mainWindowStartupReady) {
             return
         }
@@ -1348,15 +1260,16 @@ app.whenReady().then(async () => {
     // Setup IPC handlers for update functions
     ipcMain.handle("check-for-updates", async () => {
         try {
-            console.log("[Main] Checking for updates...")
+            logger.updater.info("Manual update check requested")
             const result = await autoUpdater.checkForUpdates()
             return {
                 updateAvailable: !!result?.updateInfo,
                 updateInfo: result?.updateInfo,
-                updateDownloaded: updateDownloaded
+                updateDownloaded: updateDownloaded,
             }
-        } catch (error) {
-            console.error("[Main] Error checking for updates:", error)
+        }
+        catch (error) {
+            logger.updater.error("Manual update check failed", formatError(error))
             throw error
         }
     })
@@ -1364,28 +1277,32 @@ app.whenReady().then(async () => {
     ipcMain.handle("install-update", async () => {
         try {
             if (!updateDownloaded) {
-                console.log("[Main] Update not downloaded yet, triggering download...")
+                logger.updater.info("Install requested before download completed; starting download")
                 // Trigger download if not already downloaded
                 await autoUpdater.checkForUpdatesAndNotify()
                 throw new Error("Update download initiated. Please wait for download to complete.")
             }
-            console.log("[Main] Installing update...")
+            logger.updater.info("Installing update")
             autoUpdater.quitAndInstall(false, true)
             return true
-        } catch (error) {
-            console.error("[Main] Error installing update:", error)
+        }
+        catch (error) {
+            logger.updater.error("Update installation failed", formatError(error))
             throw error
         }
     })
 
     ipcMain.handle("kill-server", async () => {
         if (serverProcess) {
-            console.log("[Main] Killing server before update...")
+            logger.server.info("Stopping process before update")
             serverProcess.kill()
             return true
         }
         return false
     })
+
+    registerMpvCoreIpc(mpvCoreSettings)
+    registerIpcHandlers()
 
     setupAppProtocol()
     startLocalServer()
@@ -1405,9 +1322,9 @@ app.whenReady().then(async () => {
         logStartupEvent("Server launched successfully")
         // Check for updates only after server launch and main window setup is successful
         autoUpdater.checkForUpdatesAndNotify()
-    } catch (error) {
-        logStartupEvent("Server launch failed", error.message)
-        console.error("[Main] Failed to start server:", error)
+    }
+    catch (error) {
+        logger.startup.error("Server launch failed", formatError(error))
         if (splashScreen && !splashScreen.isDestroyed()) {
             splashScreen.close()
             splashScreen = null
@@ -1418,340 +1335,350 @@ app.whenReady().then(async () => {
             crashScreen.webContents.send("crash", `The server failed to start: ${error}. Closing in 10 seconds.`)
 
             setTimeout(() => {
-                console.error("[Main] Exiting due to server start failure.")
+                logger.app.error("Exiting because server startup failed")
                 app.exit(1)
             }, 10000)
         }
     }
 
-    // Register Window Control IPC handlers
-    ipcMain.on("window:minimize", () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.minimize()
-        }
-    })
+    function registerIpcHandlers() {
+        // Register Window Control IPC handlers
+        ipcMain.on("window:minimize", () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.minimize()
+            }
+        })
 
-    ipcMain.on("window:maximize", () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.maximize()
-        }
-    })
-
-    ipcMain.on("window:close", () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.close()
-        }
-    })
-
-    ipcMain.on("window:toggleMaximize", () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            if (mainWindow.isMaximized()) {
-                mainWindow.unmaximize()
-            } else {
+        ipcMain.on("window:maximize", () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.maximize()
             }
-        }
-    })
+        })
 
-    ipcMain.on("window:setFullscreen", (_, fullscreen) => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.setFullScreen(fullscreen)
-        }
-    })
-
-    ipcMain.on("window:hide", () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            hideMainWindow()
-        }
-    })
-
-    ipcMain.on("window:show", () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-            showMainWindow()
-        }
-    })
-
-    ipcMain.handle("window:getCurrentWindow", () => {
-        const win = BrowserWindow.fromWebContents(mainWindow.webContents)
-        return win?.id
-    })
-
-    ipcMain.handle("window:isMainWindow", (event) => {
-        const win = BrowserWindow.fromWebContents(event.sender)
-        return win === mainWindow
-    })
-
-    // Window state query handlers
-    ipcMain.handle("window:isMaximized", () => {
-        return mainWindow && !mainWindow.isDestroyed() ? mainWindow.isMaximized() : false
-    })
-
-    ipcMain.handle("window:isMinimizable", () => {
-        return mainWindow && !mainWindow.isDestroyed() ? mainWindow.minimizable : false
-    })
-
-    ipcMain.handle("window:isMaximizable", () => {
-        return mainWindow && !mainWindow.isDestroyed() ? mainWindow.maximizable : false
-    })
-
-    ipcMain.handle("window:isClosable", () => {
-        return mainWindow && !mainWindow.isDestroyed() ? mainWindow.closable : false
-    })
-
-    ipcMain.handle("window:isFullscreen", () => {
-        return mainWindow && !mainWindow.isDestroyed() ? mainWindow.isFullScreen() : false
-    })
-
-    ipcMain.handle("window:isVisible", () => {
-        return mainWindow && !mainWindow.isDestroyed() ? mainWindow.isVisible() : false
-    })
-
-    // Clipboard handler
-    ipcMain.handle("clipboard:writeText", (_, text) => {
-        if (text) {
-            return require("electron").clipboard.writeText(text)
-        }
-        return false
-    })
-
-    // Register server IPC handlers
-    ipcMain.on("restart-server", () => {
-        console.log("EVENT restart-server")
-        restartSeanimeServer().catch(console.error)
-    })
-
-    ipcMain.on("kill-server", () => {
-        console.log("EVENT kill-server")
-        if (serverProcess) {
-            console.log("Killing server process")
-            serverProcess.kill()
-        }
-    })
-
-    // Watch for window events to notify renderer
-    if (mainWindow) {
-        mainWindow.on("minimize", () => {
+        ipcMain.on("window:close", () => {
             if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send("window:minimized")
+                mainWindow.close()
             }
         })
 
-        mainWindow.on("hide", () => {
+        ipcMain.on("window:toggleMaximize", () => {
             if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send("window:hidden")
+                if (mainWindow.isMaximized()) {
+                    mainWindow.unmaximize()
+                } else {
+                    mainWindow.maximize()
+                }
             }
         })
 
-        mainWindow.on("maximize", () => {
+        ipcMain.on("window:setFullscreen", (_: Electron.IpcMainEvent, fullscreen: boolean) => {
             if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send("window:maximized")
+                mainWindow.setFullScreen(fullscreen)
             }
         })
 
-        mainWindow.on("unmaximize", () => {
+        ipcMain.on("window:hide", () => {
             if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send("window:unmaximized")
+                hideMainWindow()
             }
         })
 
-        mainWindow.on("enter-full-screen", () => {
+        ipcMain.on("window:show", () => {
             if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send("window:fullscreen", true)
+                showMainWindow()
             }
         })
 
-        mainWindow.on("leave-full-screen", () => {
-            if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send("window:fullscreen", false)
-            }
+        ipcMain.handle("window:getCurrentWindow", () => {
+            if (!mainWindow) return undefined
+            const win = BrowserWindow.fromWebContents(mainWindow.webContents)
+            return win?.id
         })
-    }
 
-    // macOS specific events
-    ipcMain.on("macos-activation-policy-accessory", () => {
-        console.log("EVENT macos-activation-policy-accessory")
-        if (process.platform === "darwin") {
-            app.dock.hide()
-            mainWindow.show()
-            mainWindow.setFullScreen(true)
+        ipcMain.handle("window:isMainWindow", (event: Electron.IpcMainInvokeEvent) => {
+            const win = BrowserWindow.fromWebContents(event.sender)
+            return win === mainWindow
+        })
 
-            setTimeout(() => {
-                mainWindow.focus()
-                mainWindow.webContents.send("macos-activation-policy-accessory-done", "")
-            }, 150)
-        }
-    })
+        // Window state query handlers
+        ipcMain.handle("window:isMaximized", () => {
+            return mainWindow && !mainWindow.isDestroyed() ? mainWindow.isMaximized() : false
+        })
 
-    ipcMain.on("macos-activation-policy-regular", () => {
-        console.log("EVENT macos-activation-policy-regular")
-        if (process.platform === "darwin") {
-            app.dock.show()
-        }
-    })
+        ipcMain.handle("window:isMinimizable", () => {
+            return mainWindow && !mainWindow.isDestroyed() ? mainWindow.minimizable : false
+        })
 
-    // Quit app handler
-    ipcMain.on("quit-app", () => {
-        console.log("EVENT quit-app")
-        cleanupAndExit()
-    })
-    ipcMain.handle("get-local-server-port", () => localServerPort)
+        ipcMain.handle("window:isMaximizable", () => {
+            return mainWindow && !mainWindow.isDestroyed() ? mainWindow.maximizable : false
+        })
 
-    ipcMain.handle("denshi:allowWebviewOrigin", (event, origin) => {
-        try {
-            const parsed = new URL(origin)
-            allowedWebviewOrigins.add(parsed.origin)
-            log.info(`[Denshi] Allowed webview origin: ${parsed.origin}`)
-            return true
-        } catch (err) {
-            log.error(`[Denshi] Failed to allow webview origin ${origin}:`, err.message)
+        ipcMain.handle("window:isClosable", () => {
+            return mainWindow && !mainWindow.isDestroyed() ? mainWindow.closable : false
+        })
+
+        ipcMain.handle("window:isFullscreen", () => {
+            return mainWindow && !mainWindow.isDestroyed() ? mainWindow.isFullScreen() : false
+        })
+
+        ipcMain.handle("window:isVisible", () => {
+            return mainWindow && !mainWindow.isDestroyed() ? mainWindow.isVisible() : false
+        })
+
+        // Clipboard handler
+        ipcMain.handle("clipboard:writeText", (_: Electron.IpcMainInvokeEvent, text: string) => {
+            if (text) {
+                clipboard.writeText(text)
+                return true
+            }
             return false
-        }
-    })
+        })
 
-    ipcMain.handle("denshi:getSettings", () => {
-        return { ...denshiSettings }
-    })
-
-    ipcMain.handle("denshi:setSettings", (_, newSettings) => {
-        denshiSettings = { ...DENSHI_SETTINGS_DEFAULTS, ...denshiSettings, ...newSettings }
-        saveDenshiSettings(denshiSettings)
-        log.info("[Denshi] Settings updated:", JSON.stringify(denshiSettings))
-
-        // Apply openAtLaunch immediately (only supported on macOS and Windows)
-        if (!_development && (process.platform === "darwin" || process.platform === "win32")) {
-            app.setLoginItemSettings({
-                openAtLogin: denshiSettings.openAtLaunch,
+        // Register server IPC handlers
+        ipcMain.on("restart-server", () => {
+            logger.ipc.info("restart-server")
+            restartSeanimeServer().catch(error => {
+                logger.server.error("Restart failed", formatError(error))
             })
-        }
+        })
 
-        return { ...denshiSettings }
-    })
+        ipcMain.on("kill-server", () => {
+            logger.ipc.info("kill-server")
+            if (serverProcess) {
+                logger.server.info("Stopping process by IPC request")
+                serverProcess.kill()
+            }
+        })
 
-    // Chromecast
+        // macOS specific events
+        ipcMain.on("macos-activation-policy-accessory", () => {
+            logger.ipc.info("macos-activation-policy-accessory")
+            if (process.platform === "darwin" && mainWindow) {
+                app.dock?.hide()
+                mainWindow.show()
+                mainWindow.setFullScreen(true)
 
-    if (__CAST_ENABLED__) {
+                setTimeout(() => {
+                    if (mainWindow) {
+                        mainWindow.focus()
+                        mainWindow.webContents.send("macos-activation-policy-accessory-done", "")
+                    }
+                }, 150)
+            }
+        })
 
-        function ensureCastSender() {
-            if (!castSender) {
-                castSender = new CastSender()
+        ipcMain.on("macos-activation-policy-regular", () => {
+            logger.ipc.info("macos-activation-policy-regular")
+            if (process.platform === "darwin") {
+                app.dock?.show()
+            }
+        })
 
-                // Forward events to the renderer
-                castSender.on("deviceFound", (device) => {
-                    if (mainWindow && !mainWindow.isDestroyed()) {
-                        mainWindow.webContents.send("cast:deviceFound", device)
-                    }
-                })
-                castSender.on("sessionUpdate", (state) => {
-                    if (mainWindow && !mainWindow.isDestroyed()) {
-                        mainWindow.webContents.send("cast:sessionUpdate", state)
-                    }
-                })
-                castSender.on("mediaStatus", (status) => {
-                    if (mainWindow && !mainWindow.isDestroyed()) {
-                        mainWindow.webContents.send("cast:mediaStatus", status)
-                    }
-                })
-                castSender.on("receiverReady", () => {
-                    if (mainWindow && !mainWindow.isDestroyed()) {
-                        mainWindow.webContents.send("cast:receiverReady")
-                    }
-                })
-                castSender.on("error", (err) => {
-                    log.error("[Cast] Error:", err)
-                    if (mainWindow && !mainWindow.isDestroyed()) {
-                        mainWindow.webContents.send("cast:error", err)
-                    }
+        // Quit app handler
+        ipcMain.on("quit-app", () => {
+            logger.ipc.info("quit-app")
+            cleanupAndExit()
+        })
+
+        // Restart app handler
+        ipcMain.on("restart-app", () => {
+            logger.ipc.info("restart-app")
+            if (crashScreen && !crashScreen.isDestroyed()) {
+                crashScreen.hide()
+            }
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.reload()
+                mainWindow.show()
+            } else {
+                createMainWindow()
+            }
+        })
+        ipcMain.handle("get-local-server-port", () => getLocalServerPort())
+
+        ipcMain.handle("denshi:allowWebviewOrigin", (_: Electron.IpcMainInvokeEvent, origin: string) => {
+            try {
+                const parsed = new URL(origin)
+                allowedWebviewOrigins.add(parsed.origin)
+                logger.settings.info("Allowed webview origin", parsed.origin)
+                return true
+            }
+            catch (err) {
+                const message = err instanceof Error ? err.message : String(err)
+                logger.settings.error("Failed to allow webview origin", { origin, message })
+                return false
+            }
+        })
+
+        ipcMain.handle("denshi:getSettings", () => {
+            return { ...denshiSettings }
+        })
+
+        ipcMain.handle("denshi:setSettings", (_: Electron.IpcMainInvokeEvent, newSettings: Partial<DenshiSettings>) => {
+            denshiSettings = { ...DENSHI_SETTINGS_DEFAULTS, ...denshiSettings, ...newSettings }
+            saveDenshiSettings(denshiSettings)
+            logger.settings.info("Updated", denshiSettings)
+
+            // Apply openAtLaunch immediately (only supported on macOS and Windows)
+            if (!_development && (process.platform === "darwin" || process.platform === "win32")) {
+                app.setLoginItemSettings({
+                    openAtLogin: denshiSettings.openAtLaunch,
                 })
             }
-            return castSender
+
+            return { ...denshiSettings }
+        })
+
+        // Power save blocker
+        ipcMain.handle("power-save-blocker:start", () => {
+            try {
+                const id = powerSaveBlocker.start("prevent-display-sleep")
+                logger.power.info("Display sleep blocker started", { id })
+                return id
+            }
+            catch (e) {
+                logger.power.error("Failed to start display sleep blocker", formatError(e))
+                throw e
+            }
+        })
+
+        ipcMain.handle("power-save-blocker:stop", (_: Electron.IpcMainInvokeEvent, id: number) => {
+            try {
+                if (typeof id === "number" && powerSaveBlocker.isStarted(id)) {
+                    powerSaveBlocker.stop(id)
+                    logger.power.info("Display sleep blocker stopped", { id })
+                }
+            }
+            catch (e) {
+                logger.power.error("Failed to stop display sleep blocker", formatError(e))
+            }
+        })
+
+        // Chromecast
+
+        if (__CAST_ENABLED__) {
+
+            function ensureCastSender() {
+                if (!castSender) {
+                    castSender = new CastSender()
+
+                    // Forward events to the renderer
+                    castSender.on("deviceFound", (device: any) => {
+                        if (mainWindow && !mainWindow.isDestroyed()) {
+                            mainWindow.webContents.send("cast:deviceFound", device)
+                        }
+                    })
+                    castSender.on("sessionUpdate", (state: any) => {
+                        if (mainWindow && !mainWindow.isDestroyed()) {
+                            mainWindow.webContents.send("cast:sessionUpdate", state)
+                        }
+                    })
+                    castSender.on("mediaStatus", (status: any) => {
+                        if (mainWindow && !mainWindow.isDestroyed()) {
+                            mainWindow.webContents.send("cast:mediaStatus", status)
+                        }
+                    })
+                    castSender.on("receiverReady", () => {
+                        if (mainWindow && !mainWindow.isDestroyed()) {
+                            mainWindow.webContents.send("cast:receiverReady")
+                        }
+                    })
+                    castSender.on("error", (err: Error) => {
+                        logger.cast.error("Sender error", formatError(err))
+                        if (mainWindow && !mainWindow.isDestroyed()) {
+                            mainWindow.webContents.send("cast:error", err)
+                        }
+                    })
+                }
+                return castSender
+            }
+
+            ipcMain.handle("cast:discover", async () => {
+                const sender = ensureCastSender()
+                sender.startDiscovery()
+            })
+
+            ipcMain.handle("cast:stopDiscovery", async () => {
+                if (castSender) castSender.stopDiscovery()
+            })
+
+            ipcMain.handle("cast:getDevices", async () => {
+                if (!castSender) return []
+                return castSender.getDevices()
+            })
+
+            ipcMain.handle("cast:connect", async (_: Electron.IpcMainInvokeEvent, deviceId: string) => {
+                const sender = ensureCastSender()
+                return await sender.connect(deviceId)
+            })
+
+            ipcMain.handle("cast:disconnect", async () => {
+                if (castSender) castSender.disconnect()
+            })
+
+            ipcMain.handle("cast:getStatus", async () => {
+                if (!castSender) return { connected: false, device: null, sessionId: null, mediaStatus: null }
+                return castSender.getStatus()
+            })
+
+            ipcMain.handle("cast:loadMedia", async (_: Electron.IpcMainInvokeEvent, opts: any) => {
+                if (!castSender) throw new Error("Cast sender not initialized")
+                return castSender.loadMedia(opts)
+            })
+
+            ipcMain.handle("cast:play", async () => {
+                if (castSender) castSender.play()
+            })
+
+            ipcMain.handle("cast:pause", async () => {
+                if (castSender) castSender.pause()
+            })
+
+            ipcMain.handle("cast:seek", async (_: Electron.IpcMainInvokeEvent, time: number) => {
+                if (castSender) castSender.seek(time)
+            })
+
+            ipcMain.handle("cast:stop", async () => {
+                if (castSender) castSender.stop()
+            })
+
+            ipcMain.handle("cast:setVolume", async (_: Electron.IpcMainInvokeEvent, level: number) => {
+                if (castSender) castSender.setVolume(level)
+            })
+
+            ipcMain.handle("cast:setMuted", async (_: Electron.IpcMainInvokeEvent, muted: boolean) => {
+                if (castSender) castSender.setMuted(muted)
+            })
+
+            ipcMain.handle("cast:sendSubtitleEvents", async (_: Electron.IpcMainInvokeEvent, events: any) => {
+                if (castSender) castSender.sendSubtitleEvents(events)
+            })
+
+            ipcMain.handle("cast:sendSubtitleTracks", async (_: Electron.IpcMainInvokeEvent, tracks: any) => {
+                if (castSender) castSender.sendSubtitleTracks(tracks)
+            })
+
+            ipcMain.handle("cast:switchSubtitleTrack", async (_: Electron.IpcMainInvokeEvent, trackNumber: number) => {
+                if (castSender) castSender.switchSubtitleTrack(trackNumber)
+            })
+
+            ipcMain.handle("cast:sendFonts", async (_: Electron.IpcMainInvokeEvent, fontUrls: string[], serverPort: number) => {
+                if (castSender) castSender.sendFonts(fontUrls, serverPort)
+            })
+
+            ipcMain.handle("cast:sendSubtitleHeader", async (_: Electron.IpcMainInvokeEvent, header: string) => {
+                if (castSender) castSender.sendSubtitleHeader(header)
+            })
+
+            ipcMain.handle("cast:disableSubtitles", async () => {
+                if (castSender) castSender.disableSubtitles()
+            })
+
+            ipcMain.handle("cast:getLanIP", async () => {
+                const sender = ensureCastSender()
+                return sender.getLanIP()
+            })
+
         }
-
-        ipcMain.handle("cast:discover", async () => {
-            const sender = ensureCastSender()
-            sender.startDiscovery()
-        })
-
-        ipcMain.handle("cast:stopDiscovery", async () => {
-            if (castSender) castSender.stopDiscovery()
-        })
-
-        ipcMain.handle("cast:getDevices", async () => {
-            if (!castSender) return []
-            return castSender.getDevices()
-        })
-
-        ipcMain.handle("cast:connect", async (_, deviceId) => {
-            const sender = ensureCastSender()
-            return await sender.connect(deviceId)
-        })
-
-        ipcMain.handle("cast:disconnect", async () => {
-            if (castSender) castSender.disconnect()
-        })
-
-        ipcMain.handle("cast:getStatus", async () => {
-            if (!castSender) return { connected: false, device: null, sessionId: null, mediaStatus: null }
-            return castSender.getStatus()
-        })
-
-        ipcMain.handle("cast:loadMedia", async (_, opts) => {
-            if (!castSender) throw new Error("Cast sender not initialized")
-            return castSender.loadMedia(opts)
-        })
-
-        ipcMain.handle("cast:play", async () => {
-            if (castSender) castSender.play()
-        })
-
-        ipcMain.handle("cast:pause", async () => {
-            if (castSender) castSender.pause()
-        })
-
-        ipcMain.handle("cast:seek", async (_, time) => {
-            if (castSender) castSender.seek(time)
-        })
-
-        ipcMain.handle("cast:stop", async () => {
-            if (castSender) castSender.stop()
-        })
-
-        ipcMain.handle("cast:setVolume", async (_, level) => {
-            if (castSender) castSender.setVolume(level)
-        })
-
-        ipcMain.handle("cast:setMuted", async (_, muted) => {
-            if (castSender) castSender.setMuted(muted)
-        })
-
-        ipcMain.handle("cast:sendSubtitleEvents", async (_, events) => {
-            if (castSender) castSender.sendSubtitleEvents(events)
-        })
-
-        ipcMain.handle("cast:sendSubtitleTracks", async (_, tracks) => {
-            if (castSender) castSender.sendSubtitleTracks(tracks)
-        })
-
-        ipcMain.handle("cast:switchSubtitleTrack", async (_, trackNumber) => {
-            if (castSender) castSender.switchSubtitleTrack(trackNumber)
-        })
-
-        ipcMain.handle("cast:sendFonts", async (_, fontUrls, serverPort) => {
-            if (castSender) castSender.sendFonts(fontUrls, serverPort)
-        })
-
-        ipcMain.handle("cast:sendSubtitleHeader", async (_, header) => {
-            if (castSender) castSender.sendSubtitleHeader(header)
-        })
-
-        ipcMain.handle("cast:disableSubtitles", async () => {
-            if (castSender) castSender.disableSubtitles()
-        })
-
-        ipcMain.handle("cast:getLanIP", async () => {
-            const sender = ensureCastSender()
-            return sender.getLanIP()
-        })
-
     }
 
     app.on("window-all-closed", () => {
@@ -1767,7 +1694,7 @@ app.whenReady().then(async () => {
     // });
 
     app.on("before-quit", () => {
-        console.log("EVENT before-quit")
+        logger.app.info("before-quit")
         cleanupAndExit()
     })
 })

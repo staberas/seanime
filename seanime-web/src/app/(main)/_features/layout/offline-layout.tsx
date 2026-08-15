@@ -14,7 +14,9 @@ import { __isElectronDesktop__ } from "@/types/constants"
 import React from "react"
 import { SeaCommand } from "../sea-command/sea-command"
 import { TopIndefiniteLoader } from "../top-indefinite-loader"
+import { RateLimitLoader } from "../rate-limit-loader"
 
+const MpvCoreLazyWrapper = React.lazy(() => import("@/app/(main)/_features/mpv-core/mpv-core-lazy-wrapper"))
 const NativePlayerLazyWrapper = React.lazy(() => import("@/app/(main)/_features/native-player/native-player-lazy-wrapper"))
 
 type OfflineLayoutProps = {
@@ -64,10 +66,15 @@ export function OfflineLayout(props: OfflineLayoutProps) {
             <PluginManager />
             {__isElectronDesktop__ && (
                 <React.Suspense fallback={null}>
-                    <NativePlayerLazyWrapper />
+                    {serverStatus?.settings?.mediaPlayer?.mpvPrismEnabled ? (
+                        <MpvCoreLazyWrapper />
+                    ) : (
+                        <NativePlayerLazyWrapper />
+                    )}
                 </React.Suspense>
             )}
             <TopIndefiniteLoader />
+            <RateLimitLoader />
 
             <AppSidebarProvider>
                 <AppLayout withSidebar sidebarSize="slim">

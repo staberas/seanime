@@ -19,6 +19,7 @@ import (
 	"seanime/internal/extension_playground"
 	"seanime/internal/extension_repo"
 	"seanime/internal/hook"
+	"seanime/internal/library/anime"
 	"seanime/internal/library/autodownloader"
 	"seanime/internal/library/autoscanner"
 	"seanime/internal/library/fillermanager"
@@ -27,12 +28,14 @@ import (
 	"seanime/internal/library_explorer"
 	"seanime/internal/local"
 	"seanime/internal/manga"
+	"seanime/internal/mediacore"
 	"seanime/internal/mediaplayers/iina"
 	"seanime/internal/mediaplayers/mediaplayer"
 	"seanime/internal/mediaplayers/mpchc"
 	"seanime/internal/mediaplayers/mpv"
 	"seanime/internal/mediaplayers/vlc"
 	"seanime/internal/mediastream"
+	"seanime/internal/mpvcore"
 	"seanime/internal/nakama"
 	"seanime/internal/nativeplayer"
 	"seanime/internal/onlinestream"
@@ -59,6 +62,10 @@ import (
 )
 
 type (
+	episodeAvailability interface {
+		WithEpisodes([]*anime.Episode) []*anime.Episode
+	}
+
 	App struct {
 		// Core
 		Config   *Config
@@ -80,10 +87,11 @@ type (
 		MetadataProviderRef *util.Ref[metadata_provider.Provider]
 
 		// Library
-		FillerManager   *fillermanager.FillerManager
-		AutoDownloader  *autodownloader.AutoDownloader
-		AutoScanner     *autoscanner.AutoScanner
-		PlaybackManager *playbackmanager.PlaybackManager
+		FillerManager       *fillermanager.FillerManager
+		AutoDownloader      *autodownloader.AutoDownloader
+		AutoScanner         *autoscanner.AutoScanner
+		PlaybackManager     *playbackmanager.PlaybackManager
+		episodeAvailability episodeAvailability
 
 		// Real-time communication
 		WSEventManager *events.WSEventManager
@@ -100,15 +108,17 @@ type (
 		TorrentstreamRepository *torrentstream.Repository
 
 		// Players
-		NativePlayer *nativeplayer.NativePlayer
-		VideoCore    *videocore.VideoCore
-		MediaPlayer  struct {
+		NativePlayer         *nativeplayer.NativePlayer
+		VideoCore            *videocore.VideoCore
+		MediacoreCoordinator *mediacore.Coordinator
+		MediaPlayer          struct {
 			VLC   *vlc.VLC
 			MpcHc *mpchc.MpcHc
 			Mpv   *mpv.Mpv
 			Iina  *iina.Iina
 		}
 		MediaPlayerRepository *mediaplayer.Repository
+		MpvCore               *mpvcore.MpvCore
 
 		// Manga services
 		MangaRepository *manga.Repository
@@ -142,6 +152,7 @@ type (
 			Mediastream   *models.MediastreamSettings
 			Torrentstream *models.TorrentstreamSettings
 			Debrid        *models.DebridSettings
+			DummyDebrid   *models.DummyDebridSettings
 		}
 
 		// Metadata
@@ -175,6 +186,10 @@ type (
 		ShowTour string
 	}
 )
+
+func (a *App) WithEpisodeAvailability(episodes []*anime.Episode) []*anime.Episode {
+	return a.episodeAvailability.WithEpisodes(episodes)
+}
 
 // NewApp creates a new server instance
 func NewApp(configOpts *ConfigOptions, selfupdater *updater.SelfUpdater) *App {
@@ -415,6 +430,7 @@ func NewApp(configOpts *ConfigOptions, selfupdater *updater.SelfUpdater) *App {
 		FillerManager:                 nil, // Initialized in App.initModulesOnce
 		MangaDownloader:               nil, // Initialized in App.initModulesOnce
 		PlaybackManager:               nil, // Initialized in App.initModulesOnce
+		episodeAvailability:           nil, // Initialized in App.initModulesOnce
 		AutoDownloader:                nil, // Initialized in App.initModulesOnce
 		AutoScanner:                   nil, // Initialized in App.initModulesOnce
 		MediastreamRepository:         nil, // Initialized in App.initModulesOnce
@@ -424,6 +440,8 @@ func NewApp(configOpts *ConfigOptions, selfupdater *updater.SelfUpdater) *App {
 		DirectStreamManager:           nil, // Initialized in App.initModulesOnce
 		NativePlayer:                  nil, // Initialized in App.initModulesOnce
 		VideoCore:                     nil, // Initialized in App.initModulesOnce
+		MpvCore:                       nil, // Initialized in App.initModulesOnce
+		MediacoreCoordinator:          nil, // Initialized in App.initModulesOnce
 		NakamaManager:                 nil, // Initialized in App.initModulesOnce
 		LibraryExplorer:               nil, // Initialized in App.initModulesOnce
 		TorrentClientRepository:       nil, // Initialized in App.InitOrRefreshModules
@@ -436,7 +454,8 @@ func NewApp(configOpts *ConfigOptions, selfupdater *updater.SelfUpdater) *App {
 			Mediastream   *models.MediastreamSettings
 			Torrentstream *models.TorrentstreamSettings
 			Debrid        *models.DebridSettings
-		}{Mediastream: nil, Torrentstream: nil},
+			DummyDebrid   *models.DummyDebridSettings
+		}{Mediastream: nil, Torrentstream: nil, Debrid: nil, DummyDebrid: nil},
 		SelfUpdater:                     selfupdater,
 		moduleMu:                        sync.Mutex{},
 		OnRefreshAnilistCollectionFuncs: result.NewMap[string, func()](),
@@ -534,6 +553,9 @@ func NewApp(configOpts *ConfigOptions, selfupdater *updater.SelfUpdater) *App {
 
 	// Initialize torrentstream settings (for torrent streaming)
 	app.InitOrRefreshTorrentstreamSettings()
+
+	// Initialize dummy debrid settings before debrid providers can use them
+	app.InitOrRefreshDummyDebridSettings()
 
 	// Initialize debrid settings (for debrid services)
 	app.InitOrRefreshDebridSettings()

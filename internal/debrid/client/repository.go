@@ -10,6 +10,8 @@ import (
 	"seanime/internal/database/models"
 	"seanime/internal/debrid/alldebrid"
 	"seanime/internal/debrid/debrid"
+	"seanime/internal/debrid/dummy"
+	"seanime/internal/debrid/premiumize"
 	"seanime/internal/debrid/realdebrid"
 	"seanime/internal/debrid/torbox"
 	"seanime/internal/directstream"
@@ -41,6 +43,7 @@ type (
 		downloadLoopCancelFunc context.CancelFunc
 		torrentRepository      *torrent.Repository
 		directStreamManager    *directstream.Manager
+		dummyDebridEnabled     bool
 
 		playbackManager     *playbackmanager.PlaybackManager
 		streamManager       *StreamManager
@@ -63,6 +66,7 @@ type (
 		DirectStreamManager *directstream.Manager
 		MetadataProviderRef *util.Ref[metadata_provider.Provider]
 		PlatformRef         *util.Ref[platform.Platform]
+		DummyDebridEnabled  bool
 	}
 )
 
@@ -78,6 +82,7 @@ func NewRepository(opts *NewRepositoryOptions) (ret *Repository) {
 		torrentRepository:     opts.TorrentRepository,
 		platformRef:           opts.PlatformRef,
 		playbackManager:       opts.PlaybackManager,
+		dummyDebridEnabled:    opts.DummyDebridEnabled,
 		metadataProviderRef:   opts.MetadataProviderRef,
 		completeAnimeCache:    anilist.NewCompleteAnimeCache(),
 		ctxMap:                result.NewMap[string, context.CancelFunc](),
@@ -92,6 +97,9 @@ func NewRepository(opts *NewRepositoryOptions) (ret *Repository) {
 		TorrentRepository: opts.TorrentRepository,
 		MetadataProvider:  opts.MetadataProviderRef,
 		Platform:          opts.PlatformRef,
+		OnStatus: func(status autoselect.StreamAutoSelectStatusPayload) {
+			opts.WSEventManager.SendEvent(events.StreamAutoSelectStatus, status)
+		},
 	})
 
 	return
@@ -113,16 +121,32 @@ func (r *Repository) startOrStopDownloadLoop() {
 	}
 }
 
+func (r *Repository) closeProvider() {
+	provider, found := r.provider.Get()
+	if !found {
+		return
+	}
+
+	if closer, ok := provider.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			r.logger.Warn().Err(err).Msg("debrid: Failed to close provider")
+		}
+	}
+}
+
 // InitializeProvider is called each time the settings change
 func (r *Repository) InitializeProvider(settings *models.DebridSettings) error {
 	r.settings = settings
 
 	if !settings.Enabled {
+		r.closeProvider()
 		r.provider = mo.None[debrid.Provider]()
 		// Stop the download loop if it's running
 		r.startOrStopDownloadLoop()
 		return nil
 	}
+
+	r.closeProvider()
 
 	switch settings.Provider {
 	case "torbox":
@@ -131,6 +155,15 @@ func (r *Repository) InitializeProvider(settings *models.DebridSettings) error {
 		r.provider = mo.Some(realdebrid.NewRealDebrid(r.logger))
 	case "alldebrid":
 		r.provider = mo.Some(alldebrid.NewAllDebrid(r.logger))
+	case "premiumize":
+		r.provider = mo.Some(premiumize.NewPremiumize(r.logger, &premiumizeHashStore{db: r.db}))
+	case "dummy":
+		if r.dummyDebridEnabled {
+			r.provider = mo.Some(dummy.New(r.logger, r.db))
+		} else {
+			r.provider = mo.None[debrid.Provider]()
+			r.logger.Warn().Msg("debrid: Dummy provider is disabled")
+		}
 	default:
 		r.provider = mo.None[debrid.Provider]()
 	}
@@ -167,6 +200,34 @@ func (r *Repository) GetProvider() (debrid.Provider, error) {
 	}
 
 	return p, nil
+}
+
+// premiumizeHashStore implements premiumize.HashStore on top of the app database, so transfer
+// hashes survive a restart instead of only living in the provider's in-memory cache.
+type premiumizeHashStore struct {
+	db *db.Database
+}
+
+func (s *premiumizeHashStore) LoadAll() (map[string]string, error) {
+	rows, err := s.db.GetDebridTransferHashes("premiumize")
+	if err != nil {
+		return nil, err
+	}
+
+	ret := make(map[string]string, len(rows))
+	for _, row := range rows {
+		ret[row.TransferID] = row.Hash
+	}
+
+	return ret, nil
+}
+
+func (s *premiumizeHashStore) Save(transferId, hash string) {
+	_ = s.db.UpsertDebridTransferHash("premiumize", transferId, hash)
+}
+
+func (s *premiumizeHashStore) Delete(transferId string) {
+	_ = s.db.DeleteDebridTransferHash("premiumize", transferId)
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

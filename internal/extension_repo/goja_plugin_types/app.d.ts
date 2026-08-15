@@ -3352,6 +3352,8 @@ declare namespace $app {
          */
         metadataIssue?: string;
         baseAnime?: AL_BaseAnime;
+        torrentAvailability?: Anime_EpisodeTorrentAvailability;
+        isMissingGroup?: boolean;
         _isNakamaEpisode: boolean;
     }
 
@@ -3381,6 +3383,11 @@ declare namespace $app {
         hasImage?: boolean;
         title?: string;
     }
+
+    /**
+     * - Filepath: internal/library/anime/episode.go
+     */
+    export type Anime_EpisodeTorrentAvailability = "available" | "checking" | "waiting" | "unknown";
 
     /**
      * - Filepath: internal/library/anime/collection.go
@@ -3820,6 +3827,22 @@ declare namespace $app {
     /**
      * - Filepath: internal/discordrpc/presence/presence.go
      */
+    interface DiscordRPC_CustomActivity {
+        type?: number;
+        details: string;
+        state?: string;
+        largeImageKey?: string;
+        largeImageText?: string;
+        smallImageKey?: string;
+        smallImageText?: string;
+        buttons?: Array<DiscordRPC_Button>;
+        startTimestamp?: number;
+        endTimestamp?: number;
+    }
+
+    /**
+     * - Filepath: internal/discordrpc/presence/presence.go
+     */
     interface DiscordRPC_LegacyAnimeActivity {
         id: number;
         title: string;
@@ -4089,12 +4112,12 @@ declare namespace $app {
      * - Filepath: internal/torrent_clients/torrent_client/torrent.go
      */
     export type TorrentClient_TorrentStatus = "downloading" |
-        "seeding" |
-        "paused" |
-        "other" |
-        "stopped" |
-        "queued" |
-        "error";
+    "seeding" |
+    "paused" |
+    "other" |
+    "stopped" |
+    "queued" |
+    "error";
 
     /**
      * - Filepath: internal/torrents/torrent/search.go

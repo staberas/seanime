@@ -5,6 +5,7 @@ type WebsocketClientEventType string
 const (
 	NativePlayerEventType WebsocketClientEventType = "native-player"
 	VideoCoreEventType    WebsocketClientEventType = "videocore"
+	MpvCoreEventType      WebsocketClientEventType = "mpvcore"
 	NakamaEventType       WebsocketClientEventType = "nakama"
 	PluginEvent           WebsocketClientEventType = "plugin"
 	PlaylistEvent         WebsocketClientEventType = "playlist"
@@ -54,6 +55,8 @@ const (
 	RefreshedMangaDownloadData  = "refreshed-manga-download-data"
 	ChapterDownloadQueueUpdated = "chapter-download-queue-updated"
 	OfflineSnapshotCreated      = "offline-snapshot-created"
+	MangaPreferencesUpdated     = "manga-preferences-updated"
+	MangaSourceRefreshUpdated   = "manga-source-refresh-job-updated"
 
 	MediastreamShutdownStream = "mediastream-shutdown-stream"
 
@@ -76,12 +79,15 @@ const (
 	DebridDownloadProgress = "debrid-download-progress"
 	DebridStreamState      = "debrid-stream-state"
 
+	StreamAutoSelectStatus = "stream-auto-select-status"
+
 	InvalidateQueries = "invalidate-queries"
 	ConsoleLog        = "console-log"
 	ConsoleWarn       = "console-warn"
 
 	ShowIndefiniteLoader = "show-indefinite-loader"
 	HideIndefiniteLoader = "hide-indefinite-loader"
+	AnilistRateLimit     = "anilist-rate-limit"
 	ClientIdentity       = "client-identity"
 
 	// Nakama events

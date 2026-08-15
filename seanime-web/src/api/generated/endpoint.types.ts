@@ -21,10 +21,12 @@ import type {
     HibikeTorrent_AnimeTorrent,
     HibikeTorrent_BatchEpisodeFiles,
     LibraryExplorer_SuperUpdateFileOptions,
+    Manga_MangaSourceRefreshMode,
     Mediastream_StreamType,
     Models_AnilistSettings,
     Models_DebridSettings,
     Models_DiscordSettings,
+    Models_DummyDebridSettings,
     Models_HomeItem,
     Models_LibrarySettings,
     Models_MangaSettings,
@@ -503,6 +505,17 @@ export type CustomSourceListManga_Variables = {
  */
 export type SaveDebridSettings_Variables = {
     settings: Models_DebridSettings
+}
+
+/**
+ * - Filepath: internal/handlers/debrid.go
+ * - Filename: debrid.go
+ * - Endpoint: /api/v1/debrid/dummy/settings
+ * @description
+ * Route save dummy debrid settings.
+ */
+export type SaveDummyDebridSettings_Variables = {
+    settings: Models_DummyDebridSettings
 }
 
 /**
@@ -1133,6 +1146,18 @@ export type EditMALListEntryProgress_Variables = {
 /**
  * - Filepath: internal/handlers/manga.go
  * - Filename: manga.go
+ * - Endpoint: /api/v1/manga/source-refresh
+ * @description
+ * Route starts a background manga source refresh.
+ */
+export type StartMangaSourceRefresh_Variables = {
+    mode: Manga_MangaSourceRefreshMode
+    mediaIds?: Array<number>
+}
+
+/**
+ * - Filepath: internal/handlers/manga.go
+ * - Filename: manga.go
  * - Endpoint: /api/v1/manga/anilist/collection
  * @description
  * Route returns the user's AniList manga collection.
@@ -1277,6 +1302,18 @@ export type UpdateMangaProgress_Variables = {
 export type MangaManualSearch_Variables = {
     provider: string
     query: string
+}
+
+/**
+ * - Filepath: internal/handlers/manga.go
+ * - Filename: manga.go
+ * - Endpoint: /api/v1/manga/manual-mapping/preview
+ * @description
+ * Route returns a chapter summary for a manual manga mapping.
+ */
+export type PreviewMangaMapping_Variables = {
+    provider: string
+    mangaId: string
 }
 
 /**
@@ -1472,6 +1509,24 @@ export type DeleteMediaMetadataParent_Variables = {
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// mpvcore
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * - Filepath: internal/handlers/mpvcore.go
+ * - Filename: mpvcore.go
+ * - Endpoint: /api/v1/mpvcore/insight/character/{malId}
+ * @description
+ * Route returns the character details for MpvCore InSight.
+ */
+export type MpvCoreInSightGetCharacterDetails_Variables = {
+    /**
+     *  The MAL character ID
+     */
+    malId: number
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // nakama
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1579,6 +1634,7 @@ export type GetOnlineStreamEpisodeSource_Variables = {
     mediaId: number
     provider: string
     dubbed: boolean
+    refresh?: boolean
 }
 
 /**
@@ -2132,6 +2188,19 @@ export type VideoCoreInSightGetCharacterDetails_Variables = {
      *  The MAL character ID
      */
     malId: number
+}
+
+/**
+ * - Filepath: internal/handlers/videocore.go
+ * - Filename: videocore.go
+ * - Endpoint: /api/v1/videocore/screenshot
+ * @description
+ * Route saves a screenshot to a local directory.
+ */
+export type VideoCoreSaveScreenshot_Variables = {
+    dir: string
+    filename: string
+    base64Data: string
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

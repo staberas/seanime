@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/goccy/go-json"
 )
 
 type BaseModel struct {
@@ -103,6 +105,7 @@ type LibrarySettings struct {
 	// v3.7.0+
 	EnableExtensionSecureMode bool   `gorm:"column:enable_extension_secure_mode" json:"enableExtensionSecureMode"`
 	DefaultPlaybackSource     string `gorm:"column:default_playback_source" json:"defaultPlaybackSource"` // "", "library", "torrentstream", "debridstream", "onlinestream", "ext:[extensionId]"
+	ShowTorrentAvailability   bool   `gorm:"column:show_torrent_availability" json:"showTorrentAvailability"`
 }
 
 func (o *LibrarySettings) GetLibraryPaths() (ret []string) {
@@ -202,6 +205,9 @@ type MediaPlayerSettings struct {
 	VcTranslateApiKey         string `gorm:"column:vc_translate_api_key" json:"vcTranslateApiKey"`
 	VcTranslateBaseUrl        string `gorm:"column:vc_translate_base_url" json:"vcTranslateBaseUrl"`
 	VcTranslateModel          string `gorm:"column:vc_translate_model" json:"vcTranslateModel"`
+	MpvPrismLogging           bool   `gorm:"column:mpv_prism_logging" json:"mpvPrismLogging"`
+	MpvPrismEnabled           bool   `gorm:"column:mpv_prism_enabled" json:"mpvPrismEnabled"`
+	ScreenshotDir             string `gorm:"column:screenshot_dir" json:"screenshotDir"`
 }
 
 type TorrentSettings struct {
@@ -498,7 +504,8 @@ type TorrentstreamSettings struct {
 	// v2.7+
 	SlowSeeding bool `gorm:"column:slow_seeding" json:"slowSeeding"`
 	// v3+
-	PreloadNextStream bool `gorm:"column:preload_next_stream" json:"preloadNextStream"`
+	PreloadNextStream         bool `gorm:"column:preload_next_stream" json:"preloadNextStream"`
+	DisableAcceleratedStartup bool `gorm:"column:disable_accelerated_startup" json:"disableAcceleratedStartup"`
 }
 
 // TorrentstreamHistory used by both torrent streaming and debrid streaming to store the last selected batch that was used for each media.
@@ -567,12 +574,83 @@ type DebridSettings struct {
 	StreamPreferredResolution    string `gorm:"column:stream_preferred_resolution" json:"streamPreferredResolution"`
 }
 
+type DummyDebridSettings struct {
+	BaseModel
+	Enabled                 bool             `gorm:"column:enabled" json:"enabled"`
+	ProfileName             string           `gorm:"column:profile_name" json:"profileName"`
+	FallbackFilePath        string           `gorm:"column:fallback_file_path" json:"fallbackFilePath"`
+	Files                   DummyDebridFiles `gorm:"column:files;type:text" json:"files"`
+	Cached                  bool             `gorm:"column:cached" json:"cached"`
+	ReadyDelayMs            int              `gorm:"column:ready_delay_ms" json:"readyDelayMs"`
+	ProgressIntervalMs      int              `gorm:"column:progress_interval_ms" json:"progressIntervalMs"`
+	FirstByteDelayMs        int              `gorm:"column:first_byte_delay_ms" json:"firstByteDelayMs"`
+	BandwidthBytesPerSecond int64            `gorm:"column:bandwidth_bytes_per_second" json:"bandwidthBytesPerSecond"`
+	ChunkSize               int              `gorm:"column:chunk_size" json:"chunkSize"`
+	JitterMs                int              `gorm:"column:jitter_ms" json:"jitterMs"`
+}
+
+type DummyDebridFile struct {
+	ID            string `json:"id"`
+	Path          string `json:"path"`
+	Name          string `json:"name"`
+	EpisodeNumber int    `json:"episodeNumber"`
+	LocalFilePath string `json:"localFilePath"`
+	Size          int64  `json:"size,omitempty"`
+}
+
+type DummyDebridFiles []DummyDebridFile
+
+func (o *DummyDebridFiles) Scan(src interface{}) error {
+	if src == nil {
+		*o = nil
+		return nil
+	}
+
+	var raw []byte
+	switch v := src.(type) {
+	case []byte:
+		raw = v
+	case string:
+		raw = []byte(v)
+	default:
+		return errors.New("src value cannot cast to JSON")
+	}
+
+	if len(raw) == 0 {
+		*o = nil
+		return nil
+	}
+
+	return json.Unmarshal(raw, o)
+}
+
+func (o DummyDebridFiles) Value() (driver.Value, error) {
+	if len(o) == 0 {
+		return "[]", nil
+	}
+	bytes, err := json.Marshal(o)
+	if err != nil {
+		return nil, err
+	}
+	return string(bytes), nil
+}
+
 type DebridTorrentItem struct {
 	BaseModel
 	TorrentItemID string `gorm:"column:torrent_item_id" json:"torrentItemId"`
 	Destination   string `gorm:"column:destination" json:"destination"`
 	Provider      string `gorm:"column:provider" json:"provider"`
 	MediaId       int    `gorm:"column:media_id" json:"mediaId"`
+}
+
+// DebridTransferHash persists the info hash a debrid provider transfer was created from.
+// Some providers (e.g. Premiumize) never expose a transfer's info hash via their own API,
+// so this is the only way to recover the hash <-> transfer id mapping across restarts.
+type DebridTransferHash struct {
+	BaseModel
+	Provider   string `gorm:"column:provider;uniqueIndex:idx_debrid_transfer_hash" json:"provider"`
+	TransferID string `gorm:"column:transfer_id;uniqueIndex:idx_debrid_transfer_hash" json:"transferId"`
+	Hash       string `gorm:"column:hash;index" json:"hash"`
 }
 
 // +---------------------+
